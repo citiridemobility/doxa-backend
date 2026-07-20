@@ -1,0 +1,16 @@
+{
+  "rewrites": [
+    {
+      "source": "/health",
+      "destination": "/api/health"
+    },
+    {
+      "source": "/rails/:path*",
+      "destination": "/api/rails/:path*"
+    },
+    {
+      "source": "/paycrest/:path*",
+      "destination": "/api/paycrest/:path*"
+    }
+  ]
+}

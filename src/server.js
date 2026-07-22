@@ -66,20 +66,37 @@ function loadEnvFile(path) {
 
 loadEnvFile(envPath);
 
+function cleanEnvValue(value, keyName = '') {
+  let cleaned = String(value || '').trim();
+
+  if (keyName && cleaned.startsWith(`${keyName}=`)) {
+    cleaned = cleaned.slice(keyName.length + 1).trim();
+  }
+
+  while (
+    cleaned.length >= 2 &&
+    ((cleaned.startsWith('"') && cleaned.endsWith('"')) || (cleaned.startsWith("'") && cleaned.endsWith("'")))
+  ) {
+    cleaned = cleaned.slice(1, -1).trim();
+  }
+
+  return cleaned;
+}
+
 const config = {
   port: Number(process.env.DOXA_BACKEND_PORT || process.env.PORT || 8787),
   allowedOrigins: (process.env.DOXA_BACKEND_ALLOWED_ORIGINS || '*')
     .split(',')
     .map((origin) => origin.trim())
     .filter(Boolean),
-  railsApiBaseUrl: String(process.env.RAILS_API_BASE_URL || 'https://b2b.usetapp.xyz').trim(),
-  railsApiKey: String(process.env.RAILS_API_KEY || '').trim(),
-  railsFeeMode: String(process.env.RAILS_FEE_MODE || '').trim().toLowerCase(),
-  railsFeePercent: String(process.env.RAILS_FEE_PERCENT || '').trim(),
-  railsFeeAmount: String(process.env.RAILS_FEE_AMOUNT || '').trim(),
-  railsFeeAddress: String(process.env.RAILS_FEE_ADDRESS || '').trim(),
-  paycrestApiBaseUrl: String(process.env.PAYCREST_API_BASE_URL || 'https://api.paycrest.io/v2').trim(),
-  paycrestApiKey: String(process.env.PAYCREST_API_KEY || '').trim(),
+  railsApiBaseUrl: cleanEnvValue(process.env.RAILS_API_BASE_URL || 'https://b2b.usetapp.xyz', 'RAILS_API_BASE_URL'),
+  railsApiKey: cleanEnvValue(process.env.RAILS_API_KEY, 'RAILS_API_KEY'),
+  railsFeeMode: cleanEnvValue(process.env.RAILS_FEE_MODE, 'RAILS_FEE_MODE').toLowerCase(),
+  railsFeePercent: cleanEnvValue(process.env.RAILS_FEE_PERCENT, 'RAILS_FEE_PERCENT'),
+  railsFeeAmount: cleanEnvValue(process.env.RAILS_FEE_AMOUNT, 'RAILS_FEE_AMOUNT'),
+  railsFeeAddress: cleanEnvValue(process.env.RAILS_FEE_ADDRESS, 'RAILS_FEE_ADDRESS'),
+  paycrestApiBaseUrl: cleanEnvValue(process.env.PAYCREST_API_BASE_URL || 'https://api.paycrest.io/v2', 'PAYCREST_API_BASE_URL'),
+  paycrestApiKey: cleanEnvValue(process.env.PAYCREST_API_KEY, 'PAYCREST_API_KEY'),
 };
 
 function getAllowedOrigin(req) {
@@ -362,6 +379,15 @@ async function requestRails(path, { method = 'GET', body, authenticated = false,
         message,
       });
     }
+
+    if (authenticated && /Failed to fetch API key/i.test(message)) {
+      throw new HttpError(
+        502,
+        'xchange_api_key_rejected',
+        'The Xchange service is temporarily unavailable. Please try again later.',
+      );
+    }
+
     throw new HttpError(response.status, 'rails_request_failed', message);
   }
 
@@ -372,14 +398,8 @@ async function requestRailsRate({ network, token, amount, fiat }) {
   const encodedToken = encodeURIComponent(token);
   const encodedAmount = encodeURIComponent(amount);
   const encodedFiat = encodeURIComponent(fiat);
-  const encodedNetwork = network ? encodeURIComponent(network) : '';
-  const candidatePaths = network
-    ? [
-        `/v1/rates/${encodedNetwork}/${encodedToken}/${encodedAmount}/${encodedFiat}`,
-        `/v1/rates/${encodedToken}/${encodedAmount}/${encodedFiat}?network=${encodedNetwork}`,
-        `/v1/rates/${encodedToken}/${encodedAmount}/${encodedFiat}`,
-      ]
-    : [`/v1/rates/${encodedToken}/${encodedAmount}/${encodedFiat}`];
+  const documentedPath = `/v1/rates/${encodedToken}/${encodedAmount}/${encodedFiat}`;
+  const candidatePaths = [documentedPath];
   let lastError;
 
   for (const candidatePath of candidatePaths) {
@@ -391,6 +411,56 @@ async function requestRailsRate({ network, token, amount, fiat }) {
       if (error instanceof HttpError && (error.status === 401 || error.status === 403)) {
         break;
       }
+    }
+  }
+
+  if (lastError instanceof HttpError && lastError.status >= 500) {
+    try {
+      const currenciesPayload = await requestRails('/v1/currencies', { logFailure: false });
+      const currencies = Array.isArray(currenciesPayload?.data)
+        ? currenciesPayload.data
+        : Array.isArray(currenciesPayload)
+          ? currenciesPayload
+          : [];
+      const currency = currencies.find((item) => String(item?.code || '').toUpperCase() === fiat);
+      const rawMarketRate = currency?.marketRate ?? currency?.ceiling_rate ?? currency?.ceilingRate;
+      const marketRate = Number(rawMarketRate);
+
+      if (Number.isFinite(marketRate) && marketRate > 0) {
+        const fallbackRate = marketRate * 0.995;
+        const rate = fallbackRate
+          .toFixed(8)
+          .replace(/\.?0+$/, '');
+
+        console.warn('Rails rate endpoint unavailable; using currency market-rate fallback', {
+          network,
+          token,
+          amount,
+          fiat,
+          rate,
+        });
+
+        return {
+          status: 'success',
+          message: 'Rate fetched from market-rate fallback',
+          data: {
+            rate,
+            rateId: '',
+            token,
+            currency: fiat,
+            expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+            fallback: true,
+          },
+        };
+      }
+    } catch (fallbackError) {
+      console.warn('Rails market-rate fallback failed', {
+        network,
+        token,
+        amount,
+        fiat,
+        message: fallbackError instanceof Error ? fallbackError.message : 'Unable to fetch currency market rate.',
+      });
     }
   }
 
@@ -430,6 +500,52 @@ function paycrestDetails(payload) {
   return undefined;
 }
 
+function sanitizeXchangeServiceText(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+
+  if (/api\s*-?key|access-token|authorization|credential|secret|unauthorized|forbidden/i.test(text)) {
+    return '';
+  }
+
+  return text
+    .replace(/paycrest/gi, 'Xchange service')
+    .replace(/rails/gi, 'Xchange service')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function sanitizeXchangeServiceDetails(details) {
+  if (details === undefined) return undefined;
+
+  const serialized = typeof details === 'string' ? details : JSON.stringify(details);
+  if (/api\s*-?key|access-token|authorization|credential|secret|unauthorized|forbidden/i.test(serialized)) {
+    return undefined;
+  }
+
+  const sanitizeValue = (value) => {
+    if (typeof value === 'string') {
+      const sanitized = sanitizeXchangeServiceText(value);
+      return sanitized || undefined;
+    }
+
+    if (Array.isArray(value)) {
+      const nextItems = value.map(sanitizeValue).filter((item) => item !== undefined);
+      return nextItems.length > 0 ? nextItems : undefined;
+    }
+
+    if (value && typeof value === 'object') {
+      const nextEntries = Object.entries(value)
+        .map(([key, nestedValue]) => [key, sanitizeValue(nestedValue)])
+        .filter(([, nestedValue]) => nestedValue !== undefined);
+      return nextEntries.length > 0 ? Object.fromEntries(nextEntries) : undefined;
+    }
+
+    return value;
+  };
+
+  return sanitizeValue(details);
+}
 function requirePaycrestString(value, name, pattern) {
   if (typeof value !== 'string' || !value.trim()) {
     throw new HttpError(400, 'invalid_paycrest_params', `${name} is required.`);
@@ -680,16 +796,25 @@ async function requestPaycrest(path, { method = 'GET', body, authenticated = tru
   const payload = await readResponseJson(response);
 
   if (!response.ok) {
+    const providerMessage = paycrestMessage(payload, 'Unable to complete this Xchange request.');
+    const isAuthFailure =
+      response.status === 401 ||
+      response.status === 403 ||
+      /api\s*-?key|access-token|authorization|credential|secret|unauthorized|forbidden/i.test(providerMessage);
+
     console.warn('Paycrest API request failed', {
       path,
       status: response.status,
-      message: paycrestMessage(payload, 'No Paycrest error message returned.'),
+      message: providerMessage,
     });
+
     throw new HttpError(
-      response.status,
-      'paycrest_request_failed',
-      paycrestMessage(payload, 'Unable to complete Paycrest request.'),
-      paycrestDetails(payload),
+      isAuthFailure ? 502 : response.status,
+      isAuthFailure ? 'xchange_service_unavailable' : 'paycrest_request_failed',
+      isAuthFailure
+        ? 'The Xchange service is temporarily unavailable. Please try again later.'
+        : sanitizeXchangeServiceText(providerMessage) || 'Unable to complete this Xchange request.',
+      isAuthFailure ? undefined : sanitizeXchangeServiceDetails(paycrestDetails(payload)),
     );
   }
 

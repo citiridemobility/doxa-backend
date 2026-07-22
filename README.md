@@ -1,30 +1,21 @@
-﻿# Doxa Backend
+# Doxa Backend
 
 This backend proxies provider calls that must not expose secret API keys in the Expo app.
 
-## Rails Xchange Off-ramp
-
-Flow:
-
-```txt
-Doxa app -> /rails/currencies, /rails/institutions, /rails/rates
-Doxa app -> POST /rails/verify-account -> Rails account name lookup
-Doxa app -> POST /rails/orders -> Rails returns EVM Gateway createOrder params
-Doxa wallet -> approve Gateway + createOrder on-chain
-Doxa app -> POST /rails/orders/:orderRef/submitted -> Rails tracks payout status
-```
-
-## Paycrest Xchange On-ramp
+## Paycrest Xchange Buy/Sell
 
 Flow:
 
 ```txt
 Doxa app -> /paycrest/currencies, /paycrest/institutions, /paycrest/tokens, /paycrest/rates
-Doxa app -> POST /paycrest/verify-account -> Paycrest account name lookup
-Doxa app -> POST /paycrest/orders -> Paycrest returns fiat payment instructions
-User pays the returned provider account -> Paycrest settles crypto to the user's wallet
-Doxa app -> GET /paycrest/orders/:id -> poll order status
+Doxa app -> POST /paycrest/verify-account -> account name lookup
+Buy:  Doxa app -> POST /paycrest/orders -> generated fiat payment instructions
+Sell: Doxa app -> POST /paycrest/orders -> generated stablecoin receive address
+Sell: Doxa wallet sends stablecoin to the receive address and passes the user wallet as refundAddress
+Doxa app -> GET /paycrest/orders/:id -> poll payout/refund status
 ```
+
+For sell orders, the user's wallet address is sent as `source.refundAddress`. If payout cannot be completed after the user has sent funds, the order can refund crypto back to that source wallet according to the provider's order status flow.
 
 ## Local
 
@@ -32,32 +23,27 @@ Doxa app -> GET /paycrest/orders/:id -> poll order status
 npm run backend
 ```
 
-Set the Expo app endpoints:
+Set the Expo app endpoint:
 
 ```env
-EXPO_PUBLIC_RAILS_OFFRAMP_ENDPOINT=http://localhost:8787/rails
-EXPO_PUBLIC_PAYCREST_ONRAMP_ENDPOINT=http://localhost:8787/paycrest
+EXPO_PUBLIC_PAYCREST_XCHANGE_ENDPOINT=http://localhost:8787/paycrest
 ```
 
-For a physical phone on the same Wi-Fi, use your computer LAN IP instead of localhost.
+Existing app env files can keep `EXPO_PUBLIC_PAYCREST_ONRAMP_ENDPOINT`; the app uses it as a fallback. For a physical phone on the same Wi-Fi, use your computer LAN IP instead of localhost.
 
 ## Required Backend Env
 
 ```env
-RAILS_API_BASE_URL=https://b2b.usetapp.xyz
-RAILS_API_KEY=your_rails_api_key
 PAYCREST_API_BASE_URL=https://api.paycrest.io/v2
 PAYCREST_API_KEY=your_paycrest_api_key
 DOXA_BACKEND_ALLOWED_ORIGINS=*
 ```
 
-Optional Doxa off-ramp fee settings:
+Do not paste env keys with wrapping quotes or the variable name in the value field. In Vercel/Railway, the `PAYCREST_API_KEY` value should be only the raw key string, not `PAYCREST_API_KEY=...` and not `"..."`.
 
-```env
-RAILS_FEE_MODE=percent
-RAILS_FEE_PERCENT=0.3
-RAILS_FEE_ADDRESS=0xYourTreasuryAddress
-```
+## Legacy Rails Routes
+
+The backend still contains legacy `/rails/*` proxy routes, but the current Xchange buy and sell UI uses `/paycrest/*`.
 
 ## Deploy To Vercel
 
@@ -69,11 +55,10 @@ Health check:
 curl https://your-vercel-project.vercel.app/health
 ```
 
-Expo production endpoints:
+Expo production endpoint:
 
 ```env
-EXPO_PUBLIC_RAILS_OFFRAMP_ENDPOINT=https://your-vercel-project.vercel.app/rails
-EXPO_PUBLIC_PAYCREST_ONRAMP_ENDPOINT=https://your-vercel-project.vercel.app/paycrest
+EXPO_PUBLIC_PAYCREST_XCHANGE_ENDPOINT=https://your-vercel-project.vercel.app/paycrest
 ```
 
 Restart/rebuild the Expo app so the public env values are bundled.

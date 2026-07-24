@@ -83,6 +83,17 @@ function cleanEnvValue(value, keyName = '') {
   return cleaned;
 }
 
+function normalizePaycrestApiBaseUrl(value) {
+  const cleaned = cleanEnvValue(value || 'https://api.paycrest.io/v2', 'PAYCREST_API_BASE_URL').replace(/\/+$/, '');
+
+  if (!cleaned) return 'https://api.paycrest.io/v2';
+  if (/\/v2$/i.test(cleaned)) return cleaned;
+  if (/\/v1$/i.test(cleaned)) return cleaned.replace(/\/v1$/i, '/v2');
+  if (/^https?:\/\/api(?:-gateway)?\.paycrest\.io$/i.test(cleaned)) return `${cleaned}/v2`;
+
+  return cleaned;
+}
+
 const config = {
   port: Number(process.env.PORT || process.env.DOXA_BACKEND_PORT || 8787),
   allowedOrigins: (process.env.DOXA_BACKEND_ALLOWED_ORIGINS || '*')
@@ -95,7 +106,7 @@ const config = {
   railsFeePercent: cleanEnvValue(process.env.RAILS_FEE_PERCENT, 'RAILS_FEE_PERCENT'),
   railsFeeAmount: cleanEnvValue(process.env.RAILS_FEE_AMOUNT, 'RAILS_FEE_AMOUNT'),
   railsFeeAddress: cleanEnvValue(process.env.RAILS_FEE_ADDRESS, 'RAILS_FEE_ADDRESS'),
-  paycrestApiBaseUrl: cleanEnvValue(process.env.PAYCREST_API_BASE_URL || 'https://api.paycrest.io/v2', 'PAYCREST_API_BASE_URL'),
+  paycrestApiBaseUrl: normalizePaycrestApiBaseUrl(process.env.PAYCREST_API_BASE_URL),
   paycrestApiKey: cleanEnvValue(process.env.PAYCREST_API_KEY, 'PAYCREST_API_KEY'),
 };
 

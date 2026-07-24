@@ -35,6 +35,7 @@ Existing app env files can keep `EXPO_PUBLIC_PAYCREST_ONRAMP_ENDPOINT`; the app 
 
 ```env
 PAYCREST_API_BASE_URL=https://api.paycrest.io/v2
+# The backend normalizes https://api.paycrest.io and /v1 values to Paycrest v2, but production should still use /v2 explicitly.
 PAYCREST_API_KEY=your_paycrest_api_key
 DOXA_BACKEND_ALLOWED_ORIGINS=*
 ```

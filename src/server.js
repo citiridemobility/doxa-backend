@@ -667,16 +667,18 @@ function sanitizePaycrestOrderBody(body) {
     amount: normalizePaycrestAmount(body.amount),
   };
 
-  if (typeof body.amountIn === 'string' && body.amountIn.trim()) {
-    const amountIn = body.amountIn.trim().toLowerCase();
-    if (amountIn !== 'fiat' && amountIn !== 'crypto') {
-      throw new HttpError(400, 'invalid_paycrest_params', 'amountIn must be fiat or crypto.');
-    }
-    sanitized.amountIn = amountIn;
+  const rawAmountIn = typeof body.amountIn === 'string' && body.amountIn.trim()
+    ? body.amountIn.trim().toLowerCase()
+    : '';
+
+  if (rawAmountIn && rawAmountIn !== 'fiat' && rawAmountIn !== 'crypto') {
+    throw new HttpError(400, 'invalid_paycrest_params', 'amountIn must be fiat or crypto.');
   }
 
-  if (typeof body.rate === 'string' && body.rate.trim()) {
-    sanitized.rate = normalizePaycrestAmount(body.rate, 'rate');
+  if (isOnramp) {
+    sanitized.amountIn = 'fiat';
+  } else if (rawAmountIn === 'fiat') {
+    throw new HttpError(400, 'invalid_paycrest_params', 'Sell order amount must be a token amount.');
   }
 
   if (typeof body.senderFeePercent === 'string' && body.senderFeePercent.trim()) {
@@ -740,9 +742,12 @@ function sanitizePaycrestRateQuery(segments, url) {
   const from = requirePaycrestString(segments[2], 'from', /^[A-Z0-9]{2,16}$/i).toUpperCase();
   const amount = normalizePaycrestAmount(segments[3]);
   const to = requirePaycrestString(segments[4], 'to', /^[A-Z0-9]{2,16}$/i).toUpperCase();
-  const supportedAssets = new Set([...PAYCREST_STABLE_TOKENS, ...PAYCREST_FIAT_CURRENCIES]);
+  const fromIsStableToken = PAYCREST_STABLE_TOKENS.has(from);
+  const toIsStableToken = PAYCREST_STABLE_TOKENS.has(to);
+  const fromIsFiat = PAYCREST_FIAT_CURRENCIES.has(from);
+  const toIsFiat = PAYCREST_FIAT_CURRENCIES.has(to);
 
-  if (!supportedAssets.has(from) || !supportedAssets.has(to)) {
+  if (!((fromIsStableToken && toIsFiat) || (fromIsFiat && toIsStableToken))) {
     throw new HttpError(400, 'invalid_paycrest_params', 'Unsupported rate pair.');
   }
 
@@ -765,7 +770,11 @@ function sanitizePaycrestRateQuery(segments, url) {
     query.set('provider_id', providerId.trim());
   }
 
-  return `/rates/${encodeURIComponent(network)}/${encodeURIComponent(from)}/${encodeURIComponent(amount)}/${encodeURIComponent(to)}${query.toString() ? `?${query.toString()}` : ''}`;
+  const upstreamFrom = fromIsFiat ? to : from;
+  const upstreamAmount = fromIsFiat ? '1' : amount;
+  const upstreamTo = fromIsFiat ? from : to;
+
+  return `/rates/${encodeURIComponent(network)}/${encodeURIComponent(upstreamFrom)}/${encodeURIComponent(upstreamAmount)}/${encodeURIComponent(upstreamTo)}${query.toString() ? `?${query.toString()}` : ''}`;
 }
 
 async function requestPaycrest(path, { method = 'GET', body, authenticated = true } = {}) {

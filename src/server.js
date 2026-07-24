@@ -84,7 +84,7 @@ function cleanEnvValue(value, keyName = '') {
 }
 
 const config = {
-  port: Number(process.env.DOXA_BACKEND_PORT || process.env.PORT || 8787),
+  port: Number(process.env.PORT || process.env.DOXA_BACKEND_PORT || 8787),
   allowedOrigins: (process.env.DOXA_BACKEND_ALLOWED_ORIGINS || '*')
     .split(',')
     .map((origin) => origin.trim())
@@ -765,12 +765,7 @@ function sanitizePaycrestRateQuery(segments, url) {
     query.set('provider_id', providerId.trim());
   }
 
-  const isFiatToToken = PAYCREST_FIAT_CURRENCIES.has(from) && PAYCREST_STABLE_TOKENS.has(to);
-  const requestFrom = isFiatToToken ? to : from;
-  const requestTo = isFiatToToken ? from : to;
-  const requestAmount = isFiatToToken ? '1' : amount;
-
-  return `/rates/${encodeURIComponent(network)}/${encodeURIComponent(requestFrom)}/${encodeURIComponent(requestAmount)}/${encodeURIComponent(requestTo)}${query.toString() ? `?${query.toString()}` : ''}`;
+  return `/rates/${encodeURIComponent(network)}/${encodeURIComponent(from)}/${encodeURIComponent(amount)}/${encodeURIComponent(to)}${query.toString() ? `?${query.toString()}` : ''}`;
 }
 
 async function requestPaycrest(path, { method = 'GET', body, authenticated = true } = {}) {
@@ -874,7 +869,7 @@ async function handlePaycrestProxy(req, res, url) {
   }
 
   if (req.method === 'GET' && segments.length === 5 && segments[0] === 'rates') {
-    const payload = await requestPaycrest(sanitizePaycrestRateQuery(segments, url));
+    const payload = await requestPaycrest(sanitizePaycrestRateQuery(segments, url), { authenticated: false });
     sendJson(req, res, 200, payload);
     return;
   }

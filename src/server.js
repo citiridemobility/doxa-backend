@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -94,6 +95,16 @@ function normalizePaycrestApiBaseUrl(value) {
   return cleaned;
 }
 
+function normalizeSogoApiBaseUrl(value) {
+  const cleaned = cleanEnvValue(value || 'https://api.sogo.africa/v1', 'SOGO_API_BASE_URL').replace(/\/+$/, '');
+
+  if (!cleaned) return 'https://api.sogo.africa/v1';
+  if (/\/v1$/i.test(cleaned)) return cleaned;
+  if (/^https?:\/\/(?:api|sandbox)\.sogo\.africa$/i.test(cleaned)) return `${cleaned}/v1`;
+
+  return cleaned;
+}
+
 const config = {
   port: Number(process.env.PORT || process.env.DOXA_BACKEND_PORT || 8787),
   allowedOrigins: (process.env.DOXA_BACKEND_ALLOWED_ORIGINS || '*')
@@ -108,6 +119,22 @@ const config = {
   railsFeeAddress: cleanEnvValue(process.env.RAILS_FEE_ADDRESS, 'RAILS_FEE_ADDRESS'),
   paycrestApiBaseUrl: normalizePaycrestApiBaseUrl(process.env.PAYCREST_API_BASE_URL),
   paycrestApiKey: cleanEnvValue(process.env.PAYCREST_API_KEY, 'PAYCREST_API_KEY'),
+  sogoApiBaseUrl: normalizeSogoApiBaseUrl(process.env.SOGO_API_BASE_URL),
+  sogoApiKey: cleanEnvValue(process.env.SOGO_API_KEY, 'SOGO_API_KEY'),
+  sogoBillsQuoteSecret: cleanEnvValue(process.env.SOGO_BILLS_QUOTE_SECRET, 'SOGO_BILLS_QUOTE_SECRET'),
+  sogoBillsTreasuryAddress: cleanEnvValue(process.env.SOGO_BILLS_TREASURY_ADDRESS, 'SOGO_BILLS_TREASURY_ADDRESS'),
+  sogoBillsRpcUrls: {
+    'bnb-chain': cleanEnvValue(process.env.SOGO_BILLS_RPC_BNB_CHAIN_URL || process.env.BSC_RPC_URL || 'https://bsc-dataseed.binance.org', 'SOGO_BILLS_RPC_BNB_CHAIN_URL'),
+    ethereum: cleanEnvValue(process.env.SOGO_BILLS_RPC_ETHEREUM_URL || process.env.ETHEREUM_RPC_URL || 'https://ethereum-rpc.publicnode.com', 'SOGO_BILLS_RPC_ETHEREUM_URL'),
+    base: cleanEnvValue(process.env.SOGO_BILLS_RPC_BASE_URL || process.env.BASE_RPC_URL || 'https://base-rpc.publicnode.com', 'SOGO_BILLS_RPC_BASE_URL'),
+    arbitrum: cleanEnvValue(process.env.SOGO_BILLS_RPC_ARBITRUM_URL || process.env.ARBITRUM_RPC_URL || 'https://arbitrum-one-rpc.publicnode.com', 'SOGO_BILLS_RPC_ARBITRUM_URL'),
+  },
+  sogoBillsUsdcAddresses: {
+    'bnb-chain': cleanEnvValue(process.env.SOGO_BILLS_USDC_BNB_CHAIN_ADDRESS || '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d', 'SOGO_BILLS_USDC_BNB_CHAIN_ADDRESS'),
+    ethereum: cleanEnvValue(process.env.SOGO_BILLS_USDC_ETHEREUM_ADDRESS || '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'SOGO_BILLS_USDC_ETHEREUM_ADDRESS'),
+    base: cleanEnvValue(process.env.SOGO_BILLS_USDC_BASE_ADDRESS || '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', 'SOGO_BILLS_USDC_BASE_ADDRESS'),
+    arbitrum: cleanEnvValue(process.env.SOGO_BILLS_USDC_ARBITRUM_ADDRESS || '0xaf88d065e77c8cC2239327C5EDb3A432268e5831', 'SOGO_BILLS_USDC_ARBITRUM_ADDRESS'),
+  },
 };
 
 function getAllowedOrigin(req) {
@@ -152,6 +179,17 @@ function assertRailsConfigured() {
 function assertPaycrestConfigured() {
   if (!config.paycrestApiKey) {
     throw new HttpError(500, 'paycrest_not_configured', 'Set PAYCREST_API_KEY on the backend.');
+  }
+}
+function assertSogoConfigured() {
+  if (!config.sogoApiKey) {
+    throw new HttpError(500, 'sogo_not_configured', 'Set SOGO_API_KEY on the backend.');
+  }
+}
+
+function assertSogoBillsCollectionConfigured() {
+  if (!config.sogoBillsTreasuryAddress || !/^0x[a-fA-F0-9]{40}$/.test(config.sogoBillsTreasuryAddress)) {
+    throw new HttpError(500, 'sogo_bills_collection_not_configured', 'Set SOGO_BILLS_TREASURY_ADDRESS on the backend.');
   }
 }
 
@@ -817,10 +855,13 @@ async function requestPaycrest(path, { method = 'GET', body, authenticated = tru
       response.status === 403 ||
       /api\s*-?key|access-token|authorization|credential|secret|unauthorized|forbidden/i.test(providerMessage);
 
+    const providerDetails = sanitizeXchangeServiceDetails(paycrestDetails(payload));
+
     console.warn('Paycrest API request failed', {
       path,
       status: response.status,
       message: providerMessage,
+      ...(providerDetails !== undefined ? { details: providerDetails } : {}),
     });
 
     throw new HttpError(
@@ -829,13 +870,490 @@ async function requestPaycrest(path, { method = 'GET', body, authenticated = tru
       isAuthFailure
         ? 'The Xchange service is temporarily unavailable. Please try again later.'
         : sanitizeXchangeServiceText(providerMessage) || 'Unable to complete this Xchange request.',
-      isAuthFailure ? undefined : sanitizeXchangeServiceDetails(paycrestDetails(payload)),
+      isAuthFailure ? undefined : providerDetails,
     );
   }
 
   return payload;
 }
 
+const SOGO_BILL_TYPES = new Set(['airtime', 'data', 'electricity']);
+const SOGO_METER_TYPES = new Set(['prepaid', 'postpaid']);
+const SOGO_PAYMENT_NETWORKS = new Set(['bnb-chain', 'ethereum', 'base', 'arbitrum']);
+const SOGO_USDC_DECIMALS = 6;
+const ERC20_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const consumedSogoBillPaymentTxHashes = new Set();
+
+function sogoMessage(payload, fallback) {
+  return payload?.message || payload?.error?.message || payload?.error || payload?.errorMessage || payload?.data?.message || fallback;
+}
+
+function sanitizeBillsServiceText(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+
+  if (/api\s*-?key|access-token|authorization|credential|secret|unauthorized|forbidden/i.test(text)) {
+    return '';
+  }
+
+  return text
+    .replace(/sogo/gi, 'Bills service')
+    .replace(/partner api/gi, 'Bills service')
+    .replace(/wallet balance/gi, 'provider balance')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function requireSogoString(value, name, pattern) {
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new HttpError(400, 'invalid_bills_params', `${name} is required.`);
+  }
+
+  const trimmed = value.trim();
+  if (pattern && !pattern.test(trimmed)) {
+    throw new HttpError(400, 'invalid_bills_params', `${name} is invalid.`);
+  }
+
+  return trimmed;
+}
+
+function normalizeSogoBillType(value) {
+  const billType = requireSogoString(value, 'type', /^[a-z-]+$/i).toLowerCase();
+  if (!SOGO_BILL_TYPES.has(billType)) {
+    throw new HttpError(400, 'invalid_bills_params', 'Only airtime, data, and electricity bill payments are supported.');
+  }
+  return billType;
+}
+
+function normalizeSogoPaymentNetwork(value) {
+  const network = requireSogoString(value, 'payment.network', /^[a-z0-9-]+$/i).toLowerCase();
+  if (!SOGO_PAYMENT_NETWORKS.has(network)) {
+    throw new HttpError(400, 'invalid_bills_params', 'This USDC payment network is not supported for Bills yet.');
+  }
+  return network;
+}
+
+function normalizeSogoAmount(value, name = 'amount') {
+  const amount = typeof value === 'number' ? String(value) : requireSogoString(value, name);
+  const numeric = Number(String(amount).replace(/,/g, ''));
+
+  if (!Number.isFinite(numeric) || numeric < 50) {
+    throw new HttpError(400, 'invalid_bills_params', `${name} must be at least NGN 50.`);
+  }
+
+  return Math.round(numeric);
+}
+
+function getConfiguredSogoUsdcAddress(network) {
+  const address = config.sogoBillsUsdcAddresses[network];
+  if (!address || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
+    throw new HttpError(500, 'sogo_bills_usdc_not_configured', `USDC is not configured for ${network}.`);
+  }
+  return address.toLowerCase();
+}
+
+async function requestSogo(path, { method = 'GET', body, idempotencyKey } = {}) {
+  assertSogoConfigured();
+
+  const headers = {
+    Accept: 'application/json',
+    Authorization: `Bearer ${config.sogoApiKey}`,
+  };
+
+  if (body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+  }
+
+  if (idempotencyKey) {
+    headers['Idempotency-Key'] = idempotencyKey;
+  }
+
+  const response = await fetch(`${config.sogoApiBaseUrl.replace(/\/$/, '')}${path}`, {
+    method,
+    headers,
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  });
+  const payload = await readResponseJson(response);
+
+  if (!response.ok) {
+    const providerMessage = sogoMessage(payload, 'Unable to complete this Bills request.');
+    const isAuthFailure =
+      response.status === 401 ||
+      response.status === 403 ||
+      /api\s*-?key|access-token|authorization|credential|secret|unauthorized|forbidden/i.test(providerMessage);
+
+    console.warn('Sogo API request failed', {
+      path,
+      status: response.status,
+      message: providerMessage,
+    });
+
+    throw new HttpError(
+      isAuthFailure ? 502 : response.status,
+      isAuthFailure ? 'bills_service_unavailable' : 'sogo_request_failed',
+      isAuthFailure
+        ? 'The Bills service is temporarily unavailable. Please try again later.'
+        : sanitizeBillsServiceText(providerMessage) || 'Unable to complete this Bills request.',
+    );
+  }
+
+  return payload;
+}
+
+function getSogoRateValue(payload) {
+  const data = payload?.data && typeof payload.data === 'object' ? payload.data : payload;
+  const candidates = [data?.user_receives_ngn, data?.estimated_ngn, data?.rate, data?.usd_ngn_rate];
+
+  for (const candidate of candidates) {
+    const numeric = Number(candidate);
+    if (Number.isFinite(numeric) && numeric > 0) {
+      return numeric;
+    }
+  }
+
+  return 0;
+}
+
+function decimalRawToString(raw, decimals) {
+  const value = BigInt(raw);
+  const scale = 10n ** BigInt(decimals);
+  const whole = value / scale;
+  const fractional = value % scale;
+
+  if (fractional === 0n) return whole.toString();
+
+  return `${whole}.${fractional.toString().padStart(decimals, '0').replace(/0+$/, '')}`;
+}
+
+function formatNgnAmount(amount) {
+  return Number(amount).toFixed(2).replace(/\.00$/, '');
+}
+
+function getSogoQuoteSigningSecret() {
+  return config.sogoBillsQuoteSecret || config.sogoApiKey;
+}
+
+function getSignedQuotePayload(quote) {
+  return {
+    id: quote.id,
+    asset: quote.asset,
+    fiat: quote.fiat,
+    fiatAmount: quote.fiatAmount,
+    rate: quote.rate,
+    usdcAmount: quote.usdcAmount,
+    usdcAmountRaw: quote.usdcAmountRaw,
+    decimals: quote.decimals,
+    issuedAt: quote.issuedAt,
+    expiresAt: quote.expiresAt,
+  };
+}
+
+function signSogoBillsQuote(quote) {
+  return createHmac('sha256', getSogoQuoteSigningSecret())
+    .update(JSON.stringify(getSignedQuotePayload(quote)))
+    .digest('hex');
+}
+
+function verifySogoBillsQuote(quote) {
+  if (!quote || typeof quote !== 'object' || Array.isArray(quote)) {
+    throw new HttpError(400, 'invalid_bills_quote', 'A Bills quote is required.');
+  }
+
+  const signature = requireSogoString(quote.signature, 'quote.signature', /^[a-f0-9]{64}$/i);
+  const expected = signSogoBillsQuote(quote);
+  const signatureBuffer = Buffer.from(signature, 'hex');
+  const expectedBuffer = Buffer.from(expected, 'hex');
+
+  if (signatureBuffer.length !== expectedBuffer.length || !timingSafeEqual(signatureBuffer, expectedBuffer)) {
+    throw new HttpError(400, 'invalid_bills_quote', 'The Bills quote is no longer valid. Refresh and try again.');
+  }
+
+  const expiresAt = Date.parse(requireSogoString(quote.expiresAt, 'quote.expiresAt'));
+  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+    throw new HttpError(400, 'expired_bills_quote', 'The Bills quote has expired. Refresh and try again.');
+  }
+
+  const usdcAmountRaw = BigInt(requireSogoString(quote.usdcAmountRaw, 'quote.usdcAmountRaw', /^[0-9]+$/));
+  if (usdcAmountRaw <= 0n) {
+    throw new HttpError(400, 'invalid_bills_quote', 'The Bills quote amount is invalid.');
+  }
+
+  return {
+    ...getSignedQuotePayload(quote),
+    signature,
+  };
+}
+
+async function buildSogoBillsQuote(amount) {
+  const fiatAmount = normalizeSogoAmount(amount);
+  const ratePayload = await requestSogo('/crypto/assets/usdc/rate?amount=1');
+  const effectiveNgnPerUsdc = getSogoRateValue(ratePayload);
+
+  if (!effectiveNgnPerUsdc) {
+    throw new HttpError(502, 'bills_quote_unavailable', 'Unable to fetch a USDC quote for this bill right now.');
+  }
+
+  const rawAmount = BigInt(Math.ceil((fiatAmount / effectiveNgnPerUsdc) * 10 ** SOGO_USDC_DECIMALS));
+  const quote = {
+    id: randomUUID(),
+    asset: 'USDC',
+    fiat: 'NGN',
+    fiatAmount: formatNgnAmount(fiatAmount),
+    rate: String(effectiveNgnPerUsdc),
+    usdcAmount: decimalRawToString(rawAmount, SOGO_USDC_DECIMALS),
+    usdcAmountRaw: rawAmount.toString(),
+    decimals: SOGO_USDC_DECIMALS,
+    issuedAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 3 * 60 * 1000).toISOString(),
+  };
+
+  return {
+    ...quote,
+    signature: signSogoBillsQuote(quote),
+  };
+}
+
+async function requestJsonRpc(rpcUrl, method, params) {
+  const response = await fetch(rpcUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params }),
+  });
+  const payload = await readResponseJson(response);
+
+  if (!response.ok || payload?.error) {
+    throw new HttpError(502, 'bills_payment_verification_unavailable', 'Unable to verify the USDC payment on-chain right now.');
+  }
+
+  return payload.result;
+}
+
+function addressFromTopic(topic) {
+  const value = String(topic || '').toLowerCase();
+  if (!/^0x[a-f0-9]{64}$/.test(value)) return '';
+  return `0x${value.slice(-40)}`;
+}
+
+async function verifySogoBillsUsdcPayment({ payment, quote }) {
+  assertSogoBillsCollectionConfigured();
+
+  if (!payment || typeof payment !== 'object' || Array.isArray(payment)) {
+    throw new HttpError(400, 'invalid_bills_payment', 'USDC payment details are required.');
+  }
+
+  const network = normalizeSogoPaymentNetwork(payment.network);
+  const rpcUrl = config.sogoBillsRpcUrls[network];
+  const txHash = requireSogoString(payment.txHash, 'payment.txHash', /^0x[a-fA-F0-9]{64}$/).toLowerCase();
+  const walletAddress = requireSogoString(payment.walletAddress, 'payment.walletAddress', /^0x[a-fA-F0-9]{40}$/).toLowerCase();
+  const tokenAddress = requireSogoString(payment.tokenAddress, 'payment.tokenAddress', /^0x[a-fA-F0-9]{40}$/).toLowerCase();
+  const treasuryAddress = config.sogoBillsTreasuryAddress.toLowerCase();
+  const configuredUsdcAddress = getConfiguredSogoUsdcAddress(network);
+
+  if (tokenAddress !== configuredUsdcAddress) {
+    throw new HttpError(400, 'invalid_bills_payment', 'The selected USDC token is not supported for Bills on this network.');
+  }
+
+  if (consumedSogoBillPaymentTxHashes.has(txHash)) {
+    throw new HttpError(409, 'bills_payment_already_used', 'This USDC payment has already been used for a bill.');
+  }
+
+  const receipt = await requestJsonRpc(rpcUrl, 'eth_getTransactionReceipt', [txHash]);
+  if (!receipt) {
+    throw new HttpError(409, 'bills_payment_pending', 'The USDC payment is not confirmed yet. Wait a moment and try again.');
+  }
+
+  if (String(receipt.status).toLowerCase() !== '0x1') {
+    throw new HttpError(400, 'bills_payment_failed', 'The USDC payment failed on-chain.');
+  }
+
+  const expectedRawAmount = BigInt(quote.usdcAmountRaw);
+  const matchingTransfer = (receipt.logs || []).find((log) => {
+    const topics = Array.isArray(log?.topics) ? log.topics : [];
+    if (String(log?.address || '').toLowerCase() !== tokenAddress) return false;
+    if (String(topics[0] || '').toLowerCase() !== ERC20_TRANSFER_TOPIC) return false;
+    if (addressFromTopic(topics[1]) !== walletAddress) return false;
+    if (addressFromTopic(topics[2]) !== treasuryAddress) return false;
+
+    try {
+      return BigInt(log.data || '0x0') >= expectedRawAmount;
+    } catch {
+      return false;
+    }
+  });
+
+  if (!matchingTransfer) {
+    throw new HttpError(400, 'bills_payment_not_found', 'Doxa could not confirm the required USDC payment for this bill.');
+  }
+
+  return { network, txHash, walletAddress, tokenAddress, treasuryAddress };
+}
+
+function sanitizeSogoBillPurchaseBody(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw new HttpError(400, 'invalid_bills_params', 'Bill payment payload is required.');
+  }
+
+  const type = normalizeSogoBillType(body.type);
+  const amount = normalizeSogoAmount(body.amount);
+  const quote = verifySogoBillsQuote(body.quote);
+  const quotedNgnAmount = Math.round(Number(quote.fiatAmount));
+
+  if (quotedNgnAmount !== amount) {
+    throw new HttpError(400, 'invalid_bills_quote', 'The Bills quote does not match this payment amount. Refresh and try again.');
+  }
+
+  const base = {
+    type,
+    amount,
+    quote,
+    payment: body.payment,
+    idempotencyKey: typeof body.idempotencyKey === 'string' && body.idempotencyKey.trim()
+      ? body.idempotencyKey.trim().slice(0, 128)
+      : randomUUID(),
+  };
+
+  if (type === 'airtime') {
+    return {
+      ...base,
+      upstreamPath: '/bills/airtime',
+      upstreamBody: {
+        network: requireSogoString(body.network, 'network', /^[a-z0-9-]+$/i).toLowerCase(),
+        phone: requireSogoString(body.phone, 'phone', /^\+?[0-9\s-]{10,16}$/).replace(/[\s-]/g, ''),
+        amount,
+      },
+    };
+  }
+
+  if (type === 'data') {
+    return {
+      ...base,
+      upstreamPath: '/bills/data',
+      upstreamBody: {
+        network: requireSogoString(body.network, 'network', /^[a-z0-9-]+$/i).toLowerCase(),
+        phone: requireSogoString(body.phone, 'phone', /^\+?[0-9\s-]{10,16}$/).replace(/[\s-]/g, ''),
+        variation_code: requireSogoString(body.variationCode || body.variation_code, 'variationCode', /^[a-zA-Z0-9_.:-]+$/),
+      },
+    };
+  }
+
+  const meterType = requireSogoString(body.meterType || body.meter_type, 'meterType', /^[a-z]+$/i).toLowerCase();
+  if (!SOGO_METER_TYPES.has(meterType)) {
+    throw new HttpError(400, 'invalid_bills_params', 'meterType must be prepaid or postpaid.');
+  }
+
+  return {
+    ...base,
+    upstreamPath: '/bills/electricity',
+    upstreamBody: {
+      disco_slug: requireSogoString(body.discoSlug || body.disco_slug, 'discoSlug', /^[a-z0-9-]+$/i).toLowerCase(),
+      meter_number: requireSogoString(body.meterNumber || body.meter_number, 'meterNumber', /^[0-9]{6,24}$/),
+      meter_type: meterType,
+      amount,
+    },
+  };
+}
+
+function sanitizeSogoVerifyMeterBody(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw new HttpError(400, 'invalid_bills_params', 'Meter verification payload is required.');
+  }
+
+  const meterType = requireSogoString(body.meterType || body.meter_type, 'meterType', /^[a-z]+$/i).toLowerCase();
+  if (!SOGO_METER_TYPES.has(meterType)) {
+    throw new HttpError(400, 'invalid_bills_params', 'meterType must be prepaid or postpaid.');
+  }
+
+  return {
+    disco_slug: requireSogoString(body.discoSlug || body.disco_slug, 'discoSlug', /^[a-z0-9-]+$/i).toLowerCase(),
+    meter_number: requireSogoString(body.meterNumber || body.meter_number, 'meterNumber', /^[0-9]{6,24}$/),
+    meter_type: meterType,
+  };
+}
+
+function getSogoRouteSegments(url) {
+  const segments = url.pathname.split('/').filter(Boolean);
+  const sogoIndex = segments[0] === 'api' ? 1 : 0;
+
+  if (segments[sogoIndex] !== 'sogo') {
+    return [];
+  }
+
+  const pathSegments = segments.slice(sogoIndex + 1).map((segment) => decodeURIComponent(segment));
+  return pathSegments.length > 0 ? pathSegments : getVercelCatchAllSegments(url);
+}
+
+async function handleSogoProxy(req, res, url) {
+  assertCors(req);
+  const segments = getSogoRouteSegments(url);
+
+  if (req.method === 'GET' && segments.length === 1 && segments[0] === 'health') {
+    sendJson(req, res, 200, {
+      status: 'ok',
+      service: 'doxa-sogo-bills-proxy',
+      configured: Boolean(config.sogoApiKey),
+      collectionConfigured: Boolean(config.sogoBillsTreasuryAddress),
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && segments.length === 2 && segments[0] === 'bills' && segments[1] === 'catalog') {
+    const payload = await requestSogo(`/bills/catalog${url.search || ''}`);
+    sendJson(req, res, 200, payload);
+    return;
+  }
+
+  if (req.method === 'GET' && segments.length === 2 && segments[0] === 'bills' && segments[1] === 'data-plans') {
+    const network = url.searchParams.get('network');
+    const query = network ? `?network=${encodeURIComponent(requireSogoString(network, 'network', /^[a-z0-9-]+$/i).toLowerCase())}` : '';
+    const payload = await requestSogo(`/bills/data-plans${query}`);
+    sendJson(req, res, 200, payload);
+    return;
+  }
+
+  if (req.method === 'GET' && segments.length === 2 && segments[0] === 'bills' && segments[1] === 'quote') {
+    const quote = await buildSogoBillsQuote(url.searchParams.get('amount'));
+    sendJson(req, res, 200, { data: quote });
+    return;
+  }
+
+  if (req.method === 'POST' && segments.length === 3 && segments[0] === 'bills' && segments[1] === 'electricity' && segments[2] === 'verify-meter') {
+    const body = sanitizeSogoVerifyMeterBody(await readJson(req));
+    const payload = await requestSogo('/bills/electricity/verify-meter', { method: 'POST', body });
+    sendJson(req, res, 200, payload);
+    return;
+  }
+
+  if (req.method === 'POST' && segments.length === 2 && segments[0] === 'bills' && segments[1] === 'pay') {
+    const body = sanitizeSogoBillPurchaseBody(await readJson(req));
+    const payment = await verifySogoBillsUsdcPayment({ payment: body.payment, quote: body.quote });
+    const payload = await requestSogo(body.upstreamPath, {
+      method: 'POST',
+      body: body.upstreamBody,
+      idempotencyKey: body.idempotencyKey,
+    });
+
+    consumedSogoBillPaymentTxHashes.add(payment.txHash);
+
+    sendJson(req, res, 200, {
+      message: payload?.message || 'Bill payment submitted successfully.',
+      data: {
+        bill: payload?.data ?? payload,
+        payment,
+        quote: body.quote,
+      },
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && segments.length === 3 && segments[0] === 'bills' && segments[1] === 'transactions') {
+    const reference = requireSogoString(segments[2], 'reference', /^[a-zA-Z0-9_.:-]+$/);
+    const payload = await requestSogo(`/transactions/${encodeURIComponent(reference)}?type=bill_payment`);
+    sendJson(req, res, 200, payload);
+    return;
+  }
+
+  throw new HttpError(404, 'not_found', 'Bills route not found.');
+}
 function getVercelCatchAllSegments(url) {
   return url.searchParams
     .getAll('path')
@@ -1032,6 +1550,7 @@ export async function handleRequest(req, res) {
     const isHealthRoute = url.pathname === '/health' || url.pathname === '/api/health';
     const isRailsRoute = url.pathname === '/rails' || url.pathname.startsWith('/rails/') || url.pathname === '/api/rails' || url.pathname.startsWith('/api/rails/');
     const isPaycrestRoute = url.pathname === '/paycrest' || url.pathname.startsWith('/paycrest/') || url.pathname === '/api/paycrest' || url.pathname.startsWith('/api/paycrest/');
+    const isSogoRoute = url.pathname === '/sogo' || url.pathname.startsWith('/sogo/') || url.pathname === '/api/sogo' || url.pathname.startsWith('/api/sogo/');
 
     if (req.method === 'OPTIONS') {
       assertCors(req);
@@ -1053,6 +1572,11 @@ export async function handleRequest(req, res) {
 
     if (isPaycrestRoute) {
       await handlePaycrestProxy(req, res, url);
+      return;
+    }
+
+    if (isSogoRoute) {
+      await handleSogoProxy(req, res, url);
       return;
     }
 

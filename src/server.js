@@ -893,6 +893,8 @@ const SOGO_BILL_TYPES = new Set(['airtime', 'data', 'electricity']);
 const SOGO_METER_TYPES = new Set(['prepaid', 'postpaid']);
 const SOGO_PAYMENT_NETWORKS = new Set(['bnb-chain', 'ethereum', 'base', 'arbitrum']);
 const SOGO_USDC_DECIMALS = 6;
+const SOGO_BILLS_PLATFORM_FEE_BPS = 50n;
+const SOGO_BPS_DENOMINATOR = 10000n;
 const ERC20_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const consumedSogoBillPaymentTxHashes = new Set();
 
@@ -972,21 +974,33 @@ function getConfiguredSogoUsdcDecimals(network) {
   return decimals;
 }
 
-function decimalStringToRawUnits(value, decimals) {
-  const amount = requireSogoString(value, 'quote.usdcAmount').replace(/,/g, '');
+function decimalStringToRawUnits(value, decimals, fieldName = 'quote.usdcAmount') {
+  const amount = requireSogoString(value, fieldName).replace(/,/g, '');
   if (!/^\d+(?:\.\d+)?$/.test(amount)) {
-    throw new HttpError(400, 'invalid_bills_quote', 'The Bills quote amount is invalid.');
+    throw new HttpError(400, 'invalid_bills_quote', 'The Bills USDC amount is invalid.');
   }
 
   const [wholePart, fractionalPart = ''] = amount.split('.');
   if (fractionalPart.length > decimals) {
-    throw new HttpError(400, 'invalid_bills_quote', 'The Bills quote precision is not supported on this network. Refresh and try again.');
+    throw new HttpError(400, 'invalid_bills_quote', 'The Bills USDC amount precision is not supported on this network. Refresh and try again.');
   }
 
   const scale = 10n ** BigInt(decimals);
   const whole = BigInt(wholePart || '0') * scale;
   const fractional = fractionalPart ? BigInt(fractionalPart.padEnd(decimals, '0')) : 0n;
   return whole + fractional;
+}
+
+function ceilDivide(value, divisor) {
+  return (value + divisor - 1n) / divisor;
+}
+
+function getSogoBillsPaymentBreakdown(quote, decimals) {
+  const billRawAmount = decimalStringToRawUnits(quote.usdcAmount, decimals);
+  const platformFeeRawAmount = ceilDivide(billRawAmount * SOGO_BILLS_PLATFORM_FEE_BPS, SOGO_BPS_DENOMINATOR);
+  const totalRawAmount = billRawAmount + platformFeeRawAmount;
+
+  return { billRawAmount, platformFeeRawAmount, totalRawAmount };
 }
 
 async function requestSogo(path, { method = 'GET', body, idempotencyKey } = {}) {
@@ -1248,7 +1262,15 @@ async function verifySogoBillsUsdcPayment({ payment, quote }) {
     throw new HttpError(400, 'bills_payment_failed', 'The USDC payment failed on-chain.');
   }
 
-  const expectedRawAmount = decimalStringToRawUnits(quote.usdcAmount, getConfiguredSogoUsdcDecimals(network));
+  const configuredDecimals = getConfiguredSogoUsdcDecimals(network);
+  const { billRawAmount, platformFeeRawAmount, totalRawAmount } = getSogoBillsPaymentBreakdown(quote, configuredDecimals);
+  if (payment.amount !== undefined) {
+    const reportedRawAmount = decimalStringToRawUnits(String(payment.amount), configuredDecimals, 'payment.amount');
+    if (reportedRawAmount < totalRawAmount) {
+      throw new HttpError(400, 'bills_payment_not_found', 'Doxa could not confirm the full USDC payment for this bill and platform fee.');
+    }
+  }
+
   const matchingTransfer = (receipt.logs || []).find((log) => {
     const topics = Array.isArray(log?.topics) ? log.topics : [];
     if (String(log?.address || '').toLowerCase() !== tokenAddress) return false;
@@ -1257,7 +1279,7 @@ async function verifySogoBillsUsdcPayment({ payment, quote }) {
     if (addressFromTopic(topics[2]) !== treasuryAddress) return false;
 
     try {
-      return BigInt(log.data || '0x0') >= expectedRawAmount;
+      return BigInt(log.data || '0x0') >= totalRawAmount;
     } catch {
       return false;
     }
@@ -1267,7 +1289,17 @@ async function verifySogoBillsUsdcPayment({ payment, quote }) {
     throw new HttpError(400, 'bills_payment_not_found', 'Doxa could not confirm the required USDC payment for this bill.');
   }
 
-  return { network, txHash, walletAddress, tokenAddress, treasuryAddress };
+  return {
+    network,
+    txHash,
+    walletAddress,
+    tokenAddress,
+    treasuryAddress,
+    amount: decimalRawToString(totalRawAmount, configuredDecimals),
+    billAmount: decimalRawToString(billRawAmount, configuredDecimals),
+    platformFeeAmount: decimalRawToString(platformFeeRawAmount, configuredDecimals),
+    platformFeeRate: '0.5%',
+  };
 }
 
 function sanitizeSogoBillPurchaseBody(body) {

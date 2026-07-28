@@ -17,6 +17,38 @@ Doxa app -> GET /paycrest/orders/:id -> poll payout/refund status
 
 For sell orders, the user's wallet address is sent as `source.refundAddress`. If payout cannot be completed after the user has sent funds, the order can refund crypto back to that source wallet according to the provider's order status flow.
 
+
+## Sogo Bills
+
+Flow:
+
+```txt
+Doxa app -> GET /sogo/bills/catalog and /sogo/bills/data-plans
+Doxa app -> GET /sogo/bills/quote?amount=500 -> signed USDC quote
+Doxa wallet sends quoted USDC to the configured treasury wallet
+Doxa app -> POST /sogo/bills/pay -> backend verifies the USDC transfer on-chain, then submits the bill payment
+```
+
+Required backend env:
+
+```env
+SOGO_API_BASE_URL=https://api.sogo.africa/v1
+SOGO_API_KEY=your_sogo_secret_api_key
+SOGO_BILLS_QUOTE_SECRET=your_long_random_quote_secret
+SOGO_BILLS_TREASURY_ADDRESS=your_usdc_collection_wallet
+# Optional fallback used only when the live USDC/NGN quote endpoint is unavailable.
+SOGO_BILLS_USDC_NGN_RATE=1500
+```
+
+The Sogo API key needs `bills:read`, `bills:write`, and `crypto:read` scopes for live quoting and bill payment. If `crypto:read` is not enabled yet, set `SOGO_BILLS_USDC_NGN_RATE` so the backend can still quote Bills orders.
+
+Expo app env:
+
+```env
+EXPO_PUBLIC_SOGO_BILLS_ENDPOINT=https://your-backend-domain/sogo
+EXPO_PUBLIC_DOXA_BILLS_TREASURY_ADDRESS=your_usdc_collection_wallet
+```
+
 ## Local
 
 ```bash

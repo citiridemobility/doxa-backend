@@ -95,6 +95,12 @@ function normalizePaycrestApiBaseUrl(value) {
   return cleaned;
 }
 
+function normalizeTokenDecimals(value, fallbackValue) {
+  const cleaned = cleanEnvValue(value);
+  const numeric = Number(cleaned || fallbackValue);
+  if (!Number.isInteger(numeric) || numeric < 0 || numeric > 36) return fallbackValue;
+  return numeric;
+}
 function normalizeSogoApiBaseUrl(value) {
   const cleaned = cleanEnvValue(value || 'https://api.sogo.africa/v1', 'SOGO_API_BASE_URL').replace(/\/+$/, '');
 
@@ -134,6 +140,12 @@ const config = {
     ethereum: cleanEnvValue(process.env.SOGO_BILLS_USDC_ETHEREUM_ADDRESS || '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'SOGO_BILLS_USDC_ETHEREUM_ADDRESS'),
     base: cleanEnvValue(process.env.SOGO_BILLS_USDC_BASE_ADDRESS || '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', 'SOGO_BILLS_USDC_BASE_ADDRESS'),
     arbitrum: cleanEnvValue(process.env.SOGO_BILLS_USDC_ARBITRUM_ADDRESS || '0xaf88d065e77c8cC2239327C5EDb3A432268e5831', 'SOGO_BILLS_USDC_ARBITRUM_ADDRESS'),
+  },
+  sogoBillsUsdcDecimals: {
+    'bnb-chain': normalizeTokenDecimals(process.env.SOGO_BILLS_USDC_BNB_CHAIN_DECIMALS, 18),
+    ethereum: normalizeTokenDecimals(process.env.SOGO_BILLS_USDC_ETHEREUM_DECIMALS, 6),
+    base: normalizeTokenDecimals(process.env.SOGO_BILLS_USDC_BASE_DECIMALS, 6),
+    arbitrum: normalizeTokenDecimals(process.env.SOGO_BILLS_USDC_ARBITRUM_DECIMALS, 6),
   },
 };
 
@@ -952,6 +964,31 @@ function getConfiguredSogoUsdcAddress(network) {
   return address.toLowerCase();
 }
 
+function getConfiguredSogoUsdcDecimals(network) {
+  const decimals = config.sogoBillsUsdcDecimals[network];
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 36) {
+    throw new HttpError(500, 'sogo_bills_usdc_not_configured', `USDC decimals are not configured for ${network}.`);
+  }
+  return decimals;
+}
+
+function decimalStringToRawUnits(value, decimals) {
+  const amount = requireSogoString(value, 'quote.usdcAmount').replace(/,/g, '');
+  if (!/^\d+(?:\.\d+)?$/.test(amount)) {
+    throw new HttpError(400, 'invalid_bills_quote', 'The Bills quote amount is invalid.');
+  }
+
+  const [wholePart, fractionalPart = ''] = amount.split('.');
+  if (fractionalPart.length > decimals) {
+    throw new HttpError(400, 'invalid_bills_quote', 'The Bills quote precision is not supported on this network. Refresh and try again.');
+  }
+
+  const scale = 10n ** BigInt(decimals);
+  const whole = BigInt(wholePart || '0') * scale;
+  const fractional = fractionalPart ? BigInt(fractionalPart.padEnd(decimals, '0')) : 0n;
+  return whole + fractional;
+}
+
 async function requestSogo(path, { method = 'GET', body, idempotencyKey } = {}) {
   assertSogoConfigured();
 
@@ -1000,15 +1037,44 @@ async function requestSogo(path, { method = 'GET', body, idempotencyKey } = {}) 
   return payload;
 }
 
+function getSogoNumericValue(value) {
+  if (typeof value === 'number') return Number.isFinite(value) && value > 0 ? value : 0;
+  if (typeof value === 'string') {
+    const numeric = Number(value.replace(/,/g, ''));
+    return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+  }
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    for (const key of ['raw', 'value', 'amount', 'rate', 'formatted']) {
+      const numeric = getSogoNumericValue(value[key]);
+      if (numeric > 0) return numeric;
+    }
+  }
+  return 0;
+}
+
+function getConfiguredSogoBillsRate() {
+  const numeric = getSogoNumericValue(config.sogoBillsUsdcNgnRate);
+  return numeric > 0 ? numeric : 0;
+}
+
 function getSogoRateValue(payload) {
   const data = payload?.data && typeof payload.data === 'object' ? payload.data : payload;
-  const candidates = [data?.user_receives_ngn, data?.estimated_ngn, data?.rate, data?.usd_ngn_rate];
+  const candidates = [
+    data?.user_receives_ngn,
+    data?.estimated_ngn,
+    data?.net_amount,
+    data?.rate,
+    data?.usd_ngn_rate,
+    data?.usdc_ngn_rate,
+    data?.ngn_per_usdc,
+    data?.exchange_rate,
+    data?.buy_rate,
+    data?.sell_rate,
+  ];
 
   for (const candidate of candidates) {
-    const numeric = Number(candidate);
-    if (Number.isFinite(numeric) && numeric > 0) {
-      return numeric;
-    }
+    const numeric = getSogoNumericValue(candidate);
+    if (numeric > 0) return numeric;
   }
 
   return 0;
@@ -1086,8 +1152,24 @@ function verifySogoBillsQuote(quote) {
 
 async function buildSogoBillsQuote(amount) {
   const fiatAmount = normalizeSogoAmount(amount);
-  const ratePayload = await requestSogo('/crypto/assets/usdc/rate?amount=1');
-  const effectiveNgnPerUsdc = getSogoRateValue(ratePayload);
+  let effectiveNgnPerUsdc = 0;
+
+  try {
+    const ratePayload = await requestSogo('/crypto/assets/usdc/rate?amount=1');
+    effectiveNgnPerUsdc = getSogoRateValue(ratePayload);
+
+    if (!effectiveNgnPerUsdc) {
+      console.warn('Sogo USDC rate response did not include a usable NGN rate', { ratePayload });
+    }
+  } catch (error) {
+    console.warn('Sogo USDC rate request failed; checking configured Bills fallback rate', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  if (!effectiveNgnPerUsdc) {
+    effectiveNgnPerUsdc = getConfiguredSogoBillsRate();
+  }
 
   if (!effectiveNgnPerUsdc) {
     throw new HttpError(502, 'bills_quote_unavailable', 'Unable to fetch a USDC quote for this bill right now.');
@@ -1166,7 +1248,7 @@ async function verifySogoBillsUsdcPayment({ payment, quote }) {
     throw new HttpError(400, 'bills_payment_failed', 'The USDC payment failed on-chain.');
   }
 
-  const expectedRawAmount = BigInt(quote.usdcAmountRaw);
+  const expectedRawAmount = decimalStringToRawUnits(quote.usdcAmount, getConfiguredSogoUsdcDecimals(network));
   const matchingTransfer = (receipt.logs || []).find((log) => {
     const topics = Array.isArray(log?.topics) ? log.topics : [];
     if (String(log?.address || '').toLowerCase() !== tokenAddress) return false;

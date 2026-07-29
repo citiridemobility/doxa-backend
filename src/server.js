@@ -902,6 +902,49 @@ function sogoMessage(payload, fallback) {
   return payload?.message || payload?.error?.message || payload?.error || payload?.errorMessage || payload?.data?.message || fallback;
 }
 
+function asSogoRecord(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function getSogoStatusField(record, keys) {
+  for (const key of keys) {
+    const value = record?.[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (typeof value === 'boolean') return value ? 'success' : 'failed';
+  }
+  return '';
+}
+
+function normalizeSogoBillPaymentStatus(...values) {
+  const statusKeys = ['status', 'transaction_status', 'transactionStatus', 'payment_status', 'paymentStatus', 'fulfillment_status', 'fulfillmentStatus', 'delivery_status', 'deliveryStatus', 'state', 'success'];
+  const messageKeys = ['message', 'description', 'response_message', 'responseMessage', 'status_message', 'statusMessage'];
+  const records = values.flatMap((value) => {
+    const record = asSogoRecord(value);
+    return [record, asSogoRecord(record.data), asSogoRecord(record.meta), asSogoRecord(record.bill), asSogoRecord(record.transaction), asSogoRecord(record.payment)];
+  });
+
+  for (const record of records) {
+    const status = getSogoStatusField(record, statusKeys).toLowerCase().replace(/[_-]+/g, ' ').trim();
+    if (!status) continue;
+    if (/failed|failure|declined|rejected|error|unsuccessful/.test(status)) return 'failed';
+    if (/refunded|refund|reversed|reversal/.test(status)) return 'refunded';
+    if (/cancelled|canceled/.test(status)) return 'cancelled';
+    if (/completed|complete|success|successful|delivered|fulfilled|settled|paid|approved|done|submitted/.test(status)) return 'completed';
+    if (/pending|processing|queued|in progress/.test(status)) return 'processing';
+  }
+
+  for (const record of records) {
+    const message = getSogoStatusField(record, messageKeys).toLowerCase().replace(/[_-]+/g, ' ').trim();
+    if (!message) continue;
+    if (/failed|failure|declined|rejected|error|unsuccessful/.test(message)) return 'failed';
+    if (/refunded|refund|reversed|reversal/.test(message)) return 'refunded';
+    if (/cancelled|canceled/.test(message)) return 'cancelled';
+    if (/completed|complete|success|successful|delivered|fulfilled|settled|paid|approved|done|submitted/.test(message)) return 'completed';
+    if (/pending|processing|queued|in progress/.test(message)) return 'processing';
+  }
+
+  return 'completed';
+}
 function sanitizeBillsServiceText(value) {
   const text = String(value || '').trim();
   if (!text) return '';
@@ -1448,10 +1491,16 @@ async function handleSogoProxy(req, res, url) {
 
     consumedSogoBillPaymentTxHashes.add(payment.txHash);
 
+    const billPayload = payload?.data ?? payload;
+    const billRecord = asSogoRecord(billPayload);
+    const paymentStatus = normalizeSogoBillPaymentStatus(billRecord, payload);
+
     sendJson(req, res, 200, {
-      message: payload?.message || 'Bill payment submitted successfully.',
+      status: paymentStatus,
+      message: payload?.message || (paymentStatus === 'completed' ? 'Bill payment completed successfully.' : 'Bill payment submitted successfully.'),
       data: {
-        bill: payload?.data ?? payload,
+        status: paymentStatus,
+        bill: Object.keys(billRecord).length > 0 ? { ...billRecord, status: billRecord.status ?? paymentStatus } : { status: paymentStatus },
         payment,
         quote: body.quote,
       },

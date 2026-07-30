@@ -1,4 +1,4 @@
--- Doxa Wallet Supabase metrics schema
+﻿-- Doxa Wallet Supabase metrics schema
 -- Run this in the Supabase SQL Editor for the dedicated Doxa analytics project.
 -- This stores public analytics metadata only. Never store seed phrases, private keys, passwords, or encrypted wallet payloads here.
 

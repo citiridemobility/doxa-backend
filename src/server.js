@@ -916,6 +916,12 @@ async function requestPaycrest(path, { method = 'GET', body, authenticated = tru
 const SOGO_BILL_TYPES = new Set(['airtime', 'data', 'electricity']);
 const SOGO_METER_TYPES = new Set(['prepaid', 'postpaid']);
 const SOGO_PAYMENT_NETWORKS = new Set(['bnb-chain', 'ethereum', 'base', 'arbitrum']);
+const SOGO_PAYMENT_NETWORK_LABELS = {
+  'bnb-chain': 'BNB Chain',
+  ethereum: 'Ethereum',
+  base: 'Base',
+  arbitrum: 'Arbitrum',
+};
 const SOGO_DEFAULT_STABLE_DECIMALS = 6;
 const SOGO_BILLS_PAYMENT_ASSETS = new Set(['USDC', 'USDT']);
 const SOGO_BILLS_PLATFORM_FEE_BPS = 50n;
@@ -1062,6 +1068,15 @@ function getSogoQuoteTokenAmountRaw(quote) {
   return quote.tokenAmountRaw || quote.usdcAmountRaw;
 }
 
+function getConfiguredSogoBillsTreasuryAddress() {
+  assertSogoBillsCollectionConfigured();
+  return config.sogoBillsTreasuryAddress.toLowerCase();
+}
+
+function normalizeSogoTreasuryAddress(value, fieldName = 'quote.treasuryAddress') {
+  return requireSogoString(value, fieldName, /^0x[a-fA-F0-9]{40}$/).toLowerCase();
+}
+
 function decimalStringToRawUnits(value, decimals, fieldName = 'quote.tokenAmount') {
   const amount = requireSogoString(value, fieldName).replace(/,/g, '');
   if (!/^\d+(?:\.\d+)?$/.test(amount)) {
@@ -1203,11 +1218,11 @@ function getSogoQuoteSigningSecret() {
   return config.sogoBillsQuoteSecret || config.sogoApiKey;
 }
 
-function getSignedQuotePayload(quote) {
+function getSignedQuotePayload(quote, { includeTreasury = true } = {}) {
   const asset = normalizeSogoPaymentAsset(quote.asset);
   const tokenAmount = getSogoQuoteTokenAmount(quote);
   const tokenAmountRaw = getSogoQuoteTokenAmountRaw(quote);
-  return {
+  const payload = {
     id: quote.id,
     asset,
     fiat: quote.fiat,
@@ -1221,11 +1236,17 @@ function getSignedQuotePayload(quote) {
     issuedAt: quote.issuedAt,
     expiresAt: quote.expiresAt,
   };
+
+  if (includeTreasury) {
+    payload.treasuryAddress = normalizeSogoTreasuryAddress(quote.treasuryAddress || config.sogoBillsTreasuryAddress);
+  }
+
+  return payload;
 }
 
-function signSogoBillsQuote(quote) {
+function signSogoBillsQuote(quote, options) {
   return createHmac('sha256', getSogoQuoteSigningSecret())
-    .update(JSON.stringify(getSignedQuotePayload(quote)))
+    .update(JSON.stringify(getSignedQuotePayload(quote, options)))
     .digest('hex');
 }
 
@@ -1236,10 +1257,14 @@ function verifySogoBillsQuote(quote) {
 
   const signature = requireSogoString(quote.signature, 'quote.signature', /^[a-f0-9]{64}$/i);
   const expected = signSogoBillsQuote(quote);
+  const legacyExpected = quote.treasuryAddress ? '' : signSogoBillsQuote(quote, { includeTreasury: false });
   const signatureBuffer = Buffer.from(signature, 'hex');
   const expectedBuffer = Buffer.from(expected, 'hex');
+  const legacyExpectedBuffer = legacyExpected ? Buffer.from(legacyExpected, 'hex') : Buffer.alloc(0);
+  const matchesExpected = signatureBuffer.length === expectedBuffer.length && timingSafeEqual(signatureBuffer, expectedBuffer);
+  const matchesLegacy = legacyExpectedBuffer.length > 0 && signatureBuffer.length === legacyExpectedBuffer.length && timingSafeEqual(signatureBuffer, legacyExpectedBuffer);
 
-  if (signatureBuffer.length !== expectedBuffer.length || !timingSafeEqual(signatureBuffer, expectedBuffer)) {
+  if (!matchesExpected && !matchesLegacy) {
     throw new HttpError(400, 'invalid_bills_quote', 'The Bills quote is no longer valid. Refresh and try again.');
   }
 
@@ -1261,6 +1286,7 @@ function verifySogoBillsQuote(quote) {
 
 async function buildSogoBillsQuote(amount, assetInput = 'USDC') {
   const fiatAmount = normalizeSogoAmount(amount);
+  const treasuryAddress = getConfiguredSogoBillsTreasuryAddress();
   const asset = normalizeSogoPaymentAsset(assetInput);
   const assetSlug = asset.toLowerCase();
   let effectiveNgnPerToken = 0;
@@ -1298,6 +1324,7 @@ async function buildSogoBillsQuote(amount, assetInput = 'USDC') {
     tokenAmountRaw: rawAmount.toString(),
     usdcAmount: tokenAmount,
     usdcAmountRaw: rawAmount.toString(),
+    treasuryAddress,
     decimals: SOGO_DEFAULT_STABLE_DECIMALS,
     issuedAt: new Date().toISOString(),
     expiresAt: new Date(Date.now() + 3 * 60 * 1000).toISOString(),
@@ -1348,8 +1375,13 @@ async function verifySogoBillsStablePayment({ payment, quote }) {
   const txHash = requireSogoString(payment.txHash, 'payment.txHash', /^0x[a-fA-F0-9]{64}$/).toLowerCase();
   const walletAddress = requireSogoString(payment.walletAddress, 'payment.walletAddress', /^0x[a-fA-F0-9]{40}$/).toLowerCase();
   const tokenAddress = requireSogoString(payment.tokenAddress, 'payment.tokenAddress', /^0x[a-fA-F0-9]{40}$/).toLowerCase();
-  const treasuryAddress = config.sogoBillsTreasuryAddress.toLowerCase();
+  const configuredTreasuryAddress = getConfiguredSogoBillsTreasuryAddress();
+  const treasuryAddress = normalizeSogoTreasuryAddress(quote.treasuryAddress || configuredTreasuryAddress);
   const configuredTokenAddress = getConfiguredSogoTokenAddress(network, paymentAsset);
+
+  if (treasuryAddress !== configuredTreasuryAddress) {
+    throw new HttpError(400, 'invalid_bills_quote', 'The Bills collection address changed. Refresh the quote and try again.');
+  }
 
   if (tokenAddress !== configuredTokenAddress) {
     throw new HttpError(400, 'invalid_bills_payment', `The selected ${paymentAsset} token is not supported for Bills on this network.`);
@@ -1377,21 +1409,44 @@ async function verifySogoBillsStablePayment({ payment, quote }) {
     }
   }
 
-  const matchingTransfer = (receipt.logs || []).find((log) => {
-    const topics = Array.isArray(log?.topics) ? log.topics : [];
-    if (String(log?.address || '').toLowerCase() !== tokenAddress) return false;
-    if (String(topics[0] || '').toLowerCase() !== ERC20_TRANSFER_TOPIC) return false;
-    if (addressFromTopic(topics[1]) !== walletAddress) return false;
-    if (addressFromTopic(topics[2]) !== treasuryAddress) return false;
+  const relatedTransfers = (receipt.logs || [])
+    .map((log) => {
+      const topics = Array.isArray(log?.topics) ? log.topics : [];
+      if (String(log?.address || '').toLowerCase() !== tokenAddress) return null;
+      if (String(topics[0] || '').toLowerCase() !== ERC20_TRANSFER_TOPIC) return null;
+      if (addressFromTopic(topics[1]) !== walletAddress) return null;
 
-    try {
-      return BigInt(log.data || '0x0') >= totalRawAmount;
-    } catch {
-      return false;
-    }
-  });
+      let rawAmount = 0n;
+      try {
+        rawAmount = BigInt(log.data || '0x0');
+      } catch {
+        rawAmount = 0n;
+      }
+
+      return {
+        to: addressFromTopic(topics[2]),
+        amountRaw: rawAmount,
+        amountText: decimalRawToString(rawAmount, configuredDecimals),
+      };
+    })
+    .filter(Boolean);
+
+  const matchingTransfer = relatedTransfers.find((transfer) => transfer.to === treasuryAddress && transfer.amountRaw >= totalRawAmount);
 
   if (!matchingTransfer) {
+    console.warn('Bills payment transfer mismatch', {
+      asset: paymentAsset,
+      network,
+      txHash,
+      walletAddress,
+      tokenAddress,
+      expectedTreasuryAddress: treasuryAddress,
+      requiredAmount: decimalRawToString(totalRawAmount, configuredDecimals),
+      relatedTransfers: relatedTransfers.slice(0, 5).map((transfer) => ({
+        to: transfer.to,
+        amount: transfer.amountText,
+      })),
+    });
     throw new HttpError(400, 'bills_payment_not_found', `Doxa could not confirm the required ${paymentAsset} payment for this bill.`);
   }
 
@@ -1491,6 +1546,73 @@ function sanitizeSogoVerifyMeterBody(body) {
   };
 }
 
+function getFirstSogoBillText(records, keys) {
+  for (const value of records) {
+    const record = asSogoRecord(value);
+    const candidates = [record, asSogoRecord(record.data), asSogoRecord(record.bill), asSogoRecord(record.transaction), asSogoRecord(record.payment), asSogoRecord(record.meta)];
+    for (const candidate of candidates) {
+      for (const key of keys) {
+        const text = candidate?.[key];
+        if (typeof text === 'string' && text.trim()) return text.trim();
+        if (typeof text === 'number' && Number.isFinite(text)) return String(text);
+      }
+    }
+  }
+  return '';
+}
+
+function getSogoBillAnalyticsProvider(body) {
+  if (body.type === 'electricity') return body.upstreamBody?.discoSlug || body.upstreamBody?.network || 'Electricity';
+  return body.upstreamBody?.network || body.type || 'Bills';
+}
+
+function getSogoBillAnalyticsRecipient(body) {
+  if (body.type === 'electricity') return body.upstreamBody?.meterNumber || '';
+  return body.upstreamBody?.phone || '';
+}
+
+async function recordSogoBillAnalytics({ body, payment, paymentStatus, billRecord, providerPayload }) {
+  if (!config.supabaseUrl || !config.supabaseServiceRoleKey) return;
+
+  try {
+    const reference = getFirstSogoBillText([billRecord, providerPayload], ['reference', 'ref', 'id', 'transactionId', 'transaction_id', 'orderId', 'order_id']) || body.idempotencyKey;
+    const provider = getSogoBillAnalyticsProvider(body);
+    const record = sanitizeTransactionAnalyticsBody({
+      eventId: `bills:${payment.txHash}:${reference}`,
+      walletAddress: payment.walletAddress,
+      txHash: payment.txHash,
+      category: 'bills',
+      status: paymentStatus,
+      direction: 'sent',
+      networkId: payment.network,
+      networkLabel: SOGO_PAYMENT_NETWORK_LABELS[payment.network] || payment.network,
+      tokenSymbol: payment.asset,
+      tokenAddress: payment.tokenAddress,
+      amount: `${payment.amount} ${payment.asset}`,
+      fiatAmount: `NGN ${body.amount}`,
+      platformFee: `${payment.platformFeeAmount} ${payment.asset}`,
+      provider,
+      counterparty: provider,
+      reference,
+      source: 'backend',
+      occurredAt: new Date().toISOString(),
+      metadata: {
+        billType: body.type,
+        recipient: getSogoBillAnalyticsRecipient(body),
+        quoteId: body.quote?.id,
+        treasuryAddress: payment.treasuryAddress,
+        billReference: reference,
+      },
+    });
+
+    await upsertSupabaseRecord('doxa_wallet_transactions', record, 'event_id');
+  } catch (error) {
+    console.warn('Bills analytics write failed', {
+      message: error instanceof Error ? error.message : String(error),
+      txHash: payment?.txHash,
+    });
+  }
+}
 function getSogoRouteSegments(url) {
   const segments = url.pathname.split('/').filter(Boolean);
   const sogoIndex = segments[0] === 'api' ? 1 : 0;
@@ -1558,6 +1680,7 @@ async function handleSogoProxy(req, res, url) {
     const billPayload = payload?.data ?? payload;
     const billRecord = asSogoRecord(billPayload);
     const paymentStatus = normalizeSogoBillPaymentStatus(billRecord, payload);
+    await recordSogoBillAnalytics({ body, payment, paymentStatus, billRecord, providerPayload: payload });
 
     sendJson(req, res, 200, {
       status: paymentStatus,

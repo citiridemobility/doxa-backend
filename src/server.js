@@ -938,6 +938,21 @@ async function getMarketFallbackChartPrice(request) {
   const directPrice = parseMarketNumber(request.currentPrice);
   if (directPrice !== null && directPrice > 0) return directPrice;
 
+  const platformId = getMarketPlatformId(request.networkId);
+  if (request.contractAddress && platformId) {
+    try {
+      const marketData = await getMarketTokenPrices({
+        platformId,
+        contractAddresses: [request.contractAddress],
+        currency: request.currency,
+      });
+      const contractPrice = parseMarketNumber(marketData[request.contractAddress]?.price);
+      if (contractPrice !== null && contractPrice > 0) return contractPrice;
+    } catch {
+      // Continue to coin-id/stablecoin fallbacks below.
+    }
+  }
+
   const coinId = getMarketCoinId(request);
   if (coinId) {
     try {
@@ -948,8 +963,15 @@ async function getMarketFallbackChartPrice(request) {
     }
   }
 
-  if (isMarketStablecoinRequest(request, coinId) && request.currency === 'usd') {
-    return 1;
+  if (isMarketStablecoinRequest(request, coinId)) {
+    if (request.currency === 'usd') return 1;
+
+    try {
+      const currencyRate = await getMarketUsdToCurrencyRate(request.currency);
+      if (currencyRate !== null && currencyRate > 0) return currencyRate;
+    } catch {
+      return null;
+    }
   }
 
   return null;

@@ -65,6 +65,7 @@ Routes:
 ```txt
 GET /market/health
 GET /market/charts?symbol=CROSS&networkId=bnb-chain&contractAddress=0x...&range=1D&currency=usd&evmChainId=56
+GET /market/token-prices?platformId=binance-smart-chain&contractAddresses=0x...,0x...&currency=usd
 ```
 
 Backend env:
@@ -77,6 +78,7 @@ COINGECKO_PRO_API_KEY=your_coingecko_pro_key
 COINGECKO_PUBLIC_API_BASE_URL=https://api.coingecko.com/api/v3
 COINGECKO_PRO_API_BASE_URL=https://pro-api.coingecko.com/api/v3
 GECKOTERMINAL_API_BASE_URL=https://api.geckoterminal.com/api/v2
+DEXSCREENER_API_BASE_URL=https://api.dexscreener.com
 ```
 
 Expo app env:

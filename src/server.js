@@ -79,6 +79,18 @@ const MARKET_ONCHAIN_NETWORK_BY_EVM_CHAIN_ID = {
   534352: 'scroll',
   59144: 'linea',
 };
+const MARKET_DEXSCREENER_CHAIN_BY_PLATFORM = {
+  'arbitrum-one': 'arbitrum',
+  avalanche: 'avalanche',
+  base: 'base',
+  'binance-smart-chain': 'bsc',
+  ethereum: 'ethereum',
+  linea: 'linea',
+  'optimistic-ethereum': 'optimism',
+  scroll: 'scroll',
+  zksync: 'zksync',
+};
+const MARKET_TOKEN_DATA_BATCH_SIZE = 25;
 const MARKET_COIN_ID_BY_SYMBOL = {
   AVAX: 'avalanche-2',
   BNB: 'binancecoin',
@@ -236,6 +248,7 @@ const config = {
   coinGeckoApiKey: cleanEnvValue(process.env.COINGECKO_API_KEY || process.env.COINGECKO_DEMO_API_KEY, 'COINGECKO_API_KEY'),
   coinGeckoProApiKey: cleanEnvValue(process.env.COINGECKO_PRO_API_KEY, 'COINGECKO_PRO_API_KEY'),
   geckoTerminalApiBaseUrl: cleanEnvValue(process.env.GECKOTERMINAL_API_BASE_URL || 'https://api.geckoterminal.com/api/v2', 'GECKOTERMINAL_API_BASE_URL').replace(/\/+$/, ''),
+  dexScreenerApiBaseUrl: cleanEnvValue(process.env.DEXSCREENER_API_BASE_URL || 'https://api.dexscreener.com', 'DEXSCREENER_API_BASE_URL').replace(/\/+$/, ''),
   supabaseUrl: normalizeSupabaseUrl(process.env.SUPABASE_URL),
   supabaseServiceRoleKey: cleanEnvValue(process.env.SUPABASE_SERVICE_ROLE_KEY, 'SUPABASE_SERVICE_ROLE_KEY'),
   sogoApiBaseUrl: normalizeSogoApiBaseUrl(process.env.SOGO_API_BASE_URL),
@@ -648,6 +661,185 @@ async function fetchMarketSimplePrice(coinId, currency) {
   return price !== null && price > 0 ? price : null;
 }
 
+function getMarketDataFromSimpleTokenPrice(payload, address, currency) {
+  const row = asMarketRecord(payload?.[address]) ?? asMarketRecord(payload?.[address.toLowerCase()]);
+  const price = parseMarketNumber(row?.[currency]);
+  const change24h = parseMarketNumber(row?.[`${currency}_24h_change`]);
+
+  return {
+    price: price !== null && price > 0 ? price : null,
+    change24h,
+  };
+}
+
+function chunkMarketItems(items, size = MARKET_TOKEN_DATA_BATCH_SIZE) {
+  const chunks = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function normalizeMarketPlatformId(value) {
+  const platformId = getMarketString(value).toLowerCase();
+  if (!/^[a-z0-9-]{2,80}$/.test(platformId)) {
+    throw new HttpError(400, 'invalid_market_params', 'Market platform is invalid.');
+  }
+  return platformId;
+}
+
+function normalizeMarketAddressList(value) {
+  const addresses = getMarketString(value)
+    .split(',')
+    .map((address) => normalizeMarketAddress(address))
+    .filter(Boolean);
+
+  return Array.from(new Set(addresses));
+}
+
+async function fetchMarketContractPricesFromCoinGecko(platformId, contractAddresses, currency) {
+  const result = {};
+
+  for (const addressChunk of chunkMarketItems(contractAddresses)) {
+    const addressesString = addressChunk.map(encodeURIComponent).join(',');
+    const payload = await requestCoinGecko(
+      `/simple/token_price/${encodeURIComponent(platformId)}?contract_addresses=${addressesString}&vs_currencies=${encodeURIComponent(currency)}&include_market_cap=false&include_24hr_vol=false&include_24hr_change=true`,
+    );
+
+    for (const address of addressChunk) {
+      result[address] = getMarketDataFromSimpleTokenPrice(payload, address, currency);
+    }
+  }
+
+  return result;
+}
+
+function getDexScreenerPairsFromPayload(payload) {
+  const pairs = Array.isArray(payload) ? payload : Array.isArray(payload?.pairs) ? payload.pairs : [];
+  return pairs.map((pair) => asMarketRecord(pair)).filter(Boolean);
+}
+
+function selectBestMarketDexPair(pairs) {
+  return pairs.reduce((bestPair, currentPair) => {
+    if (!bestPair) return currentPair;
+
+    const bestLiquidity = parseMarketNumber(asMarketRecord(bestPair.liquidity)?.usd) || 0;
+    const currentLiquidity = parseMarketNumber(asMarketRecord(currentPair.liquidity)?.usd) || 0;
+    const bestVolume = parseMarketNumber(asMarketRecord(bestPair.volume)?.h24) || 0;
+    const currentVolume = parseMarketNumber(asMarketRecord(currentPair.volume)?.h24) || 0;
+    const bestScore = bestLiquidity * 10 + bestVolume;
+    const currentScore = currentLiquidity * 10 + currentVolume;
+
+    return currentScore > bestScore ? currentPair : bestPair;
+  }, null);
+}
+
+async function getMarketUsdToCurrencyRate(currency) {
+  if (currency === 'usd') return 1;
+
+  try {
+    return await fetchMarketSimplePrice('usd-coin', currency);
+  } catch {
+    return null;
+  }
+}
+
+async function requestDexScreener(path) {
+  return requestMarketProvider(`${config.dexScreenerApiBaseUrl}${path}`);
+}
+
+async function fetchDexScreenerContractPrices(platformId, contractAddresses, currency) {
+  const chainId = MARKET_DEXSCREENER_CHAIN_BY_PLATFORM[platformId];
+  if (!chainId) return {};
+
+  const requestedAddresses = new Set(contractAddresses);
+  const pairsByAddress = new Map();
+
+  for (const addressChunk of chunkMarketItems(contractAddresses)) {
+    const encodedAddresses = addressChunk.map(encodeURIComponent).join(',');
+    const endpoints = [
+      `/tokens/v1/${encodeURIComponent(chainId)}/${encodedAddresses}`,
+      `/latest/dex/tokens/${encodedAddresses}`,
+    ];
+
+    for (const endpoint of endpoints) {
+      try {
+        const payload = await requestDexScreener(endpoint);
+        const pairs = getDexScreenerPairsFromPayload(payload).filter((pair) => !pair.chainId || pair.chainId === chainId);
+
+        for (const pair of pairs) {
+          const baseTokenAddress = normalizeMarketAddress(asMarketRecord(pair.baseToken)?.address);
+          if (!baseTokenAddress || !requestedAddresses.has(baseTokenAddress)) continue;
+
+          const tokenPairs = pairsByAddress.get(baseTokenAddress) || [];
+          tokenPairs.push(pair);
+          pairsByAddress.set(baseTokenAddress, tokenPairs);
+        }
+      } catch {
+        // Try the next DexScreener endpoint/chunk.
+      }
+    }
+  }
+
+  const usdToCurrencyRate = await getMarketUsdToCurrencyRate(currency);
+  const result = {};
+
+  for (const address of contractAddresses) {
+    const bestPair = selectBestMarketDexPair(pairsByAddress.get(address) || []);
+    if (!bestPair) continue;
+
+    const usdPrice = parseMarketNumber(bestPair.priceUsd);
+    const price = usdPrice !== null && usdToCurrencyRate !== null ? usdPrice * usdToCurrencyRate : null;
+    result[address] = {
+      price: price !== null && price > 0 ? price : null,
+      change24h: parseMarketNumber(asMarketRecord(bestPair.priceChange)?.h24),
+    };
+  }
+
+  return result;
+}
+
+function isCompleteMarketDataRow(row) {
+  return Boolean(row && row.price !== null && row.price !== undefined && row.change24h !== null && row.change24h !== undefined);
+}
+
+async function getMarketTokenPrices(request) {
+  const result = {};
+
+  try {
+    Object.assign(
+      result,
+      await fetchMarketContractPricesFromCoinGecko(request.platformId, request.contractAddresses, request.currency),
+    );
+  } catch (error) {
+    if (!(error instanceof HttpError) || ![401, 403, 404, 429].includes(error.status)) {
+      console.warn('Market token price provider failed', { message: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  const fallbackAddresses = request.contractAddresses.filter((address) => !isCompleteMarketDataRow(result[address]));
+  if (fallbackAddresses.length) {
+    const fallbackData = await fetchDexScreenerContractPrices(request.platformId, fallbackAddresses, request.currency);
+
+    for (const address of fallbackAddresses) {
+      const currentData = result[address] || { price: null, change24h: null };
+      const dexData = fallbackData[address];
+      result[address] = {
+        price: currentData.price ?? dexData?.price ?? null,
+        change24h: currentData.change24h ?? dexData?.change24h ?? null,
+      };
+    }
+  }
+
+  for (const address of request.contractAddresses) {
+    if (!result[address]) {
+      result[address] = { price: null, change24h: null };
+    }
+  }
+
+  return result;
+}
+
 async function fetchMarketContractChart(platformId, contractAddress, range, currency) {
   const configForRange = MARKET_CHART_RANGE_CONFIG[range];
   const payload = await requestCoinGecko(`/coins/${encodeURIComponent(platformId)}/contract/${encodeURIComponent(contractAddress)}/market_chart?vs_currency=${encodeURIComponent(currency)}&days=${encodeURIComponent(configForRange.coinGeckoDays)}`);
@@ -821,6 +1013,22 @@ async function handleMarketProxy(req, res, url) {
       service: 'doxa-market-proxy',
       configured: Boolean(config.coinGeckoApiKey || config.coinGeckoProApiKey),
     });
+    return;
+  }
+
+  if (req.method === 'GET' && segments.length === 1 && segments[0] === 'token-prices') {
+    const contractAddresses = normalizeMarketAddressList(url.searchParams.get('contractAddresses'));
+    if (!contractAddresses.length) {
+      throw new HttpError(400, 'invalid_market_params', 'At least one token contract address is required.');
+    }
+
+    const request = {
+      platformId: normalizeMarketPlatformId(url.searchParams.get('platformId')),
+      contractAddresses,
+      currency: normalizeMarketCurrency(url.searchParams.get('currency')),
+    };
+    const marketData = await getMarketTokenPrices(request);
+    sendJson(req, res, 200, { data: { marketData, refreshedAt: Date.now() } });
     return;
   }
 

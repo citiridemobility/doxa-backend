@@ -11,6 +11,10 @@
     {
       "source": "/paycrest/:path*",
       "destination": "/api/paycrest/:path*"
+    },
+    {
+      "source": "/market/:path*",
+      "destination": "/api/market/:path*"
     }
   ]
 }

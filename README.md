@@ -56,6 +56,35 @@ EXPO_PUBLIC_SOGO_BILLS_ENDPOINT=https://your-backend-domain/sogo
 EXPO_PUBLIC_DOXA_BILLS_TREASURY_ADDRESS=your_stablecoin_collection_wallet
 ```
 
+## Market Charts Proxy
+
+The token details chart should call the Doxa backend instead of CoinGecko/GeckoTerminal directly from the app. This avoids browser CORS failures, keeps API keys server-side, and centralizes rate-limit caching.
+
+Routes:
+
+```txt
+GET /market/health
+GET /market/charts?symbol=CROSS&networkId=bnb-chain&contractAddress=0x...&range=1D&currency=usd&evmChainId=56
+```
+
+Backend env:
+
+```env
+# Optional but recommended for better rate limits.
+COINGECKO_API_KEY=your_coingecko_demo_key
+COINGECKO_PRO_API_KEY=your_coingecko_pro_key
+# Optional provider URL overrides.
+COINGECKO_PUBLIC_API_BASE_URL=https://api.coingecko.com/api/v3
+COINGECKO_PRO_API_BASE_URL=https://pro-api.coingecko.com/api/v3
+GECKOTERMINAL_API_BASE_URL=https://api.geckoterminal.com/api/v2
+```
+
+Expo app env:
+
+```env
+# Optional. If omitted, the app derives /market from the configured Doxa backend endpoint, e.g. /paycrest or /sogo.
+EXPO_PUBLIC_MARKET_DATA_ENDPOINT=https://your-backend-domain/market
+```
 ## Supabase Metrics Analytics
 
 Run `backend/supabase/doxa_metrics_schema.sql` in the Supabase SQL editor before enabling the analytics endpoint. The schema stores wallet creation events and sanitized transaction metrics for swaps, bridges, Xchange, Bills, sends, and token transfers.

@@ -91,6 +91,21 @@ const MARKET_DEXSCREENER_CHAIN_BY_PLATFORM = {
   zksync: 'zksync',
 };
 const MARKET_TOKEN_DATA_BATCH_SIZE = 25;
+const HISTORY_ALCHEMY_NETWORK_BY_RECEIVE_NETWORK = {
+  'bnb-chain': 'bnb-mainnet',
+  ethereum: 'eth-mainnet',
+  base: 'base-mainnet',
+  optimism: 'opt-mainnet',
+  arbitrum: 'arb-mainnet',
+  avalanche: 'avax-mainnet',
+  linea: 'linea-mainnet',
+  zksync: 'zksync-mainnet',
+  scroll: 'scroll-mainnet',
+};
+const HISTORY_TRANSFER_CATEGORIES = ['external', 'internal', 'erc20', 'erc721', 'erc1155', 'specialnft'];
+const HISTORY_PAGE_SIZE_HEX = '0x64';
+const HISTORY_MAX_PAGES_PER_DIRECTION = 3;
+const HISTORY_DIRECTIONS = new Set(['incoming', 'outgoing']);
 const MARKET_COIN_ID_BY_SYMBOL = {
   AVAX: 'avalanche-2',
   BNB: 'binancecoin',
@@ -249,6 +264,7 @@ const config = {
   coinGeckoProApiKey: cleanEnvValue(process.env.COINGECKO_PRO_API_KEY, 'COINGECKO_PRO_API_KEY'),
   geckoTerminalApiBaseUrl: cleanEnvValue(process.env.GECKOTERMINAL_API_BASE_URL || 'https://api.geckoterminal.com/api/v2', 'GECKOTERMINAL_API_BASE_URL').replace(/\/+$/, ''),
   dexScreenerApiBaseUrl: cleanEnvValue(process.env.DEXSCREENER_API_BASE_URL || 'https://api.dexscreener.com', 'DEXSCREENER_API_BASE_URL').replace(/\/+$/, ''),
+  alchemyApiKey: cleanEnvValue(process.env.ALCHEMY_API_KEY || process.env.EXPO_PUBLIC_ALCHEMY_API_KEY || process.env.REACT_APP_ALCHEMY_API_KEY, 'ALCHEMY_API_KEY'),
   supabaseUrl: normalizeSupabaseUrl(process.env.SUPABASE_URL),
   supabaseServiceRoleKey: cleanEnvValue(process.env.SUPABASE_SERVICE_ROLE_KEY, 'SUPABASE_SERVICE_ROLE_KEY'),
   sogoApiBaseUrl: normalizeSogoApiBaseUrl(process.env.SOGO_API_BASE_URL),
@@ -1070,6 +1086,128 @@ async function handleMarketProxy(req, res, url) {
   }
 
   throw new HttpError(404, 'not_found', 'Market route not found.');
+}
+function normalizeHistoryNetworkId(value) {
+  const networkId = getMarketString(value).toLowerCase();
+  if (!HISTORY_ALCHEMY_NETWORK_BY_RECEIVE_NETWORK[networkId]) {
+    throw new HttpError(400, 'invalid_history_params', 'Transaction history is not supported for this network yet.');
+  }
+  return networkId;
+}
+
+function normalizeHistoryDirection(value) {
+  const direction = getMarketString(value).toLowerCase();
+  if (!direction) return '';
+  if (!HISTORY_DIRECTIONS.has(direction)) {
+    throw new HttpError(400, 'invalid_history_params', 'Transaction history direction is invalid.');
+  }
+  return direction;
+}
+
+function requireHistoryWalletAddress(value) {
+  const address = getMarketString(value);
+  if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
+    throw new HttpError(400, 'invalid_history_params', 'Wallet address is invalid.');
+  }
+  return address;
+}
+
+function requireAlchemyHistoryApiKey() {
+  const apiKey = cleanEnvValue(config.alchemyApiKey, 'ALCHEMY_API_KEY');
+  if (!apiKey || ['demo', 'docs-demo', 'YOUR_API_KEY', 'your_alchemy_api_key_here'].includes(apiKey)) {
+    throw new HttpError(503, 'history_provider_unconfigured', 'Transaction history is temporarily unavailable.');
+  }
+  return apiKey;
+}
+
+async function requestAlchemyHistoryTransfers({ apiKey, walletAddress, networkId, direction }) {
+  const alchemyNetwork = HISTORY_ALCHEMY_NETWORK_BY_RECEIVE_NETWORK[networkId];
+  const endpoint = `https://${alchemyNetwork}.g.alchemy.com/v2/${apiKey}`;
+  const transfers = [];
+  let pageKey;
+  let pageCount = 0;
+
+  do {
+    const transferParams = {
+      fromBlock: '0x0',
+      toBlock: 'latest',
+      category: HISTORY_TRANSFER_CATEGORIES,
+      withMetadata: true,
+      excludeZeroValue: true,
+      maxCount: HISTORY_PAGE_SIZE_HEX,
+      order: 'desc',
+      ...(direction === 'incoming' ? { toAddress: walletAddress } : { fromAddress: walletAddress }),
+      ...(pageKey ? { pageKey } : {}),
+    };
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: `${networkId}-${direction}-${pageCount}`,
+        method: 'alchemy_getAssetTransfers',
+        params: [transferParams],
+      }),
+    });
+    const payload = await readResponseJson(response);
+
+    if (!response.ok || payload?.error) {
+      throw new HttpError(response.status || 502, 'history_provider_failed', 'Transaction history is temporarily unavailable.');
+    }
+
+    transfers.push(...(Array.isArray(payload?.result?.transfers) ? payload.result.transfers : []));
+    pageKey = payload?.result?.pageKey;
+    pageCount += 1;
+  } while (pageKey && pageCount < HISTORY_MAX_PAGES_PER_DIRECTION);
+
+  return transfers;
+}
+
+async function getAlchemyHistoryTransfers(request) {
+  const apiKey = requireAlchemyHistoryApiKey();
+  const directions = request.direction ? [request.direction] : ['incoming', 'outgoing'];
+  const transferGroups = await Promise.all(
+    directions.map((direction) => requestAlchemyHistoryTransfers({ ...request, apiKey, direction })),
+  );
+
+  return transferGroups.flat();
+}
+
+function getHistoryRouteSegments(url) {
+  const segments = url.pathname.split('/').filter(Boolean);
+  const historyIndex = segments[0] === 'api' ? 1 : 0;
+
+  if (segments[historyIndex] !== 'history') return [];
+  const pathSegments = segments.slice(historyIndex + 1).map((segment) => decodeURIComponent(segment));
+  return pathSegments.length > 0 ? pathSegments : getVercelCatchAllSegments(url);
+}
+
+async function handleHistoryProxy(req, res, url) {
+  assertCors(req);
+  const segments = getHistoryRouteSegments(url);
+
+  if (req.method === 'GET' && segments.length === 1 && segments[0] === 'health') {
+    sendJson(req, res, 200, {
+      status: 'ok',
+      service: 'doxa-history-proxy',
+      provider: 'alchemy',
+      configured: Boolean(cleanEnvValue(config.alchemyApiKey, 'ALCHEMY_API_KEY')),
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && segments.length === 1 && segments[0] === 'alchemy-transfers') {
+    const request = {
+      walletAddress: requireHistoryWalletAddress(url.searchParams.get('walletAddress')),
+      networkId: normalizeHistoryNetworkId(url.searchParams.get('networkId')),
+      direction: normalizeHistoryDirection(url.searchParams.get('direction')),
+    };
+    const transfers = await getAlchemyHistoryTransfers(request);
+    sendJson(req, res, 200, { data: { transfers, provider: 'alchemy', refreshedAt: Date.now() } });
+    return;
+  }
+
+  throw new HttpError(404, 'not_found', 'History route not found.');
 }
 function railsMessage(payload, fallback) {
   return payload?.message || payload?.error?.message || payload?.error || payload?.errorMessage || payload?.data?.message || fallback;
@@ -2881,6 +3019,7 @@ export async function handleRequest(req, res) {
     const isSogoRoute = url.pathname === '/sogo' || url.pathname.startsWith('/sogo/') || url.pathname === '/api/sogo' || url.pathname.startsWith('/api/sogo/');
     const isAnalyticsRoute = url.pathname === '/analytics' || url.pathname.startsWith('/analytics/') || url.pathname === '/api/analytics' || url.pathname.startsWith('/api/analytics/');
     const isMarketRoute = url.pathname === '/market' || url.pathname.startsWith('/market/') || url.pathname === '/api/market' || url.pathname.startsWith('/api/market/');
+    const isHistoryRoute = url.pathname === '/history' || url.pathname.startsWith('/history/') || url.pathname === '/api/history' || url.pathname.startsWith('/api/history/');
 
     if (req.method === 'OPTIONS') {
       assertCors(req);
@@ -2917,6 +3056,11 @@ export async function handleRequest(req, res) {
 
     if (isMarketRoute) {
       await handleMarketProxy(req, res, url);
+      return;
+    }
+
+    if (isHistoryRoute) {
+      await handleHistoryProxy(req, res, url);
       return;
     }
 

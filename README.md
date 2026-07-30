@@ -87,6 +87,29 @@ Expo app env:
 # Optional. If omitted, the app derives /market from the configured Doxa backend endpoint, e.g. /paycrest or /sogo.
 EXPO_PUBLIC_MARKET_DATA_ENDPOINT=https://your-backend-domain/market
 ```
+## Transaction History Proxy
+
+The app can fetch transaction history through the Doxa backend so browser origin restrictions do not block Alchemy RPC calls.
+
+Routes:
+
+```txt
+GET /history/health
+GET /history/alchemy-transfers?walletAddress=0x...&networkId=bnb-chain
+```
+
+Backend env:
+
+```env
+ALCHEMY_API_KEY=your_alchemy_api_key
+```
+
+Expo app env:
+
+```env
+# Optional. If omitted, the app derives /history from the configured Doxa backend endpoint, e.g. /paycrest, /sogo, or /market.
+EXPO_PUBLIC_TRANSACTION_HISTORY_ENDPOINT=https://your-backend-domain/history
+```
 ## Supabase Metrics Analytics
 
 Run `backend/supabase/doxa_metrics_schema.sql` in the Supabase SQL editor before enabling the analytics endpoint. The schema stores wallet creation events and sanitized transaction metrics for swaps, bridges, Xchange, Bills, sends, and token transfers.

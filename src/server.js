@@ -106,6 +106,9 @@ const HISTORY_TRANSFER_CATEGORIES = ['external', 'internal', 'erc20', 'erc721', 
 const HISTORY_PAGE_SIZE_HEX = '0x64';
 const HISTORY_MAX_PAGES_PER_DIRECTION = 3;
 const HISTORY_DIRECTIONS = new Set(['incoming', 'outgoing']);
+const HISTORY_BSCSCAN_API_URL = 'https://api.bscscan.com/api';
+const HISTORY_EXPLORER_NETWORKS = new Set(['bnb-chain']);
+const HISTORY_EXPLORER_PAGE_SIZE = '100';
 const MARKET_COIN_ID_BY_SYMBOL = {
   AVAX: 'avalanche-2',
   BNB: 'binancecoin',
@@ -265,6 +268,7 @@ const config = {
   geckoTerminalApiBaseUrl: cleanEnvValue(process.env.GECKOTERMINAL_API_BASE_URL || 'https://api.geckoterminal.com/api/v2', 'GECKOTERMINAL_API_BASE_URL').replace(/\/+$/, ''),
   dexScreenerApiBaseUrl: cleanEnvValue(process.env.DEXSCREENER_API_BASE_URL || 'https://api.dexscreener.com', 'DEXSCREENER_API_BASE_URL').replace(/\/+$/, ''),
   alchemyApiKey: cleanEnvValue(process.env.ALCHEMY_API_KEY || process.env.EXPO_PUBLIC_ALCHEMY_API_KEY || process.env.REACT_APP_ALCHEMY_API_KEY, 'ALCHEMY_API_KEY'),
+  bscScanApiKey: cleanEnvValue(process.env.BSCSCAN_API_KEY || process.env.BSCSCAN_API_TOKEN || process.env.BSC_SCAN_API_KEY, 'BSCSCAN_API_KEY'),
   supabaseUrl: normalizeSupabaseUrl(process.env.SUPABASE_URL),
   supabaseServiceRoleKey: cleanEnvValue(process.env.SUPABASE_SERVICE_ROLE_KEY, 'SUPABASE_SERVICE_ROLE_KEY'),
   sogoApiBaseUrl: normalizeSogoApiBaseUrl(process.env.SOGO_API_BASE_URL),
@@ -1173,6 +1177,79 @@ async function getAlchemyHistoryTransfers(request) {
   return transferGroups.flat();
 }
 
+function normalizeHistoryExplorerNetworkId(value) {
+  const networkId = normalizeHistoryNetworkId(value);
+  if (!HISTORY_EXPLORER_NETWORKS.has(networkId)) {
+    throw new HttpError(400, 'invalid_history_params', 'Explorer transaction history is not supported for this network yet.');
+  }
+  return networkId;
+}
+
+function buildHistoryQueryString(params) {
+  return Object.entries(params)
+    .filter(([, value]) => value !== undefined && value !== null && value !== '')
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`)
+    .join('&');
+}
+
+function getBscScanHistoryApiKey() {
+  const apiKey = cleanEnvValue(config.bscScanApiKey, 'BSCSCAN_API_KEY');
+  if (!apiKey || ['demo', 'docs-demo', 'YOUR_API_KEY', 'your_bscscan_api_key_here'].includes(apiKey)) {
+    return '';
+  }
+  return apiKey;
+}
+
+async function requestBscScanHistoryList(action, walletAddress) {
+  const query = {
+    module: 'account',
+    action,
+    address: walletAddress,
+    startblock: '0',
+    endblock: '99999999',
+    page: '1',
+    offset: HISTORY_EXPLORER_PAGE_SIZE,
+    sort: 'desc',
+  };
+  const apiKey = getBscScanHistoryApiKey();
+  if (apiKey) query.apikey = apiKey;
+
+  const response = await fetch(`${HISTORY_BSCSCAN_API_URL}?${buildHistoryQueryString(query)}`, {
+    method: 'GET',
+    headers: { Accept: 'application/json' },
+  });
+  const payload = await readResponseJson(response);
+
+  if (!response.ok) {
+    throw new HttpError(response.status || 502, 'history_provider_failed', 'Transaction history is temporarily unavailable.');
+  }
+
+  if (Array.isArray(payload?.result)) {
+    return payload.result;
+  }
+
+  const message = `${payload?.message || ''} ${payload?.result || ''}`.toLowerCase();
+  if (message.includes('no transactions')) {
+    return [];
+  }
+
+  throw new HttpError(502, 'history_provider_failed', 'Transaction history is temporarily unavailable.');
+}
+
+async function getExplorerHistoryTransactions(request) {
+  const networkId = normalizeHistoryExplorerNetworkId(request.networkId);
+  if (networkId !== 'bnb-chain') {
+    throw new HttpError(400, 'invalid_history_params', 'Explorer transaction history is not supported for this network yet.');
+  }
+
+  const [tokenTransfers, nativeTransactions] = await Promise.all([
+    requestBscScanHistoryList('tokentx', request.walletAddress),
+    requestBscScanHistoryList('txlist', request.walletAddress),
+  ]);
+
+  return { tokenTransfers, nativeTransactions };
+}
+
 function getHistoryRouteSegments(url) {
   const segments = url.pathname.split('/').filter(Boolean);
   const historyIndex = segments[0] === 'api' ? 1 : 0;
@@ -1192,6 +1269,10 @@ async function handleHistoryProxy(req, res, url) {
       service: 'doxa-history-proxy',
       provider: 'alchemy',
       configured: Boolean(cleanEnvValue(config.alchemyApiKey, 'ALCHEMY_API_KEY')),
+      providers: {
+        alchemy: Boolean(cleanEnvValue(config.alchemyApiKey, 'ALCHEMY_API_KEY')),
+        bscscan: Boolean(getBscScanHistoryApiKey()),
+      },
     });
     return;
   }
@@ -1204,6 +1285,16 @@ async function handleHistoryProxy(req, res, url) {
     };
     const transfers = await getAlchemyHistoryTransfers(request);
     sendJson(req, res, 200, { data: { transfers, provider: 'alchemy', refreshedAt: Date.now() } });
+    return;
+  }
+
+  if (req.method === 'GET' && segments.length === 1 && segments[0] === 'explorer-transactions') {
+    const request = {
+      walletAddress: requireHistoryWalletAddress(url.searchParams.get('walletAddress')),
+      networkId: normalizeHistoryExplorerNetworkId(url.searchParams.get('networkId')),
+    };
+    const explorerTransactions = await getExplorerHistoryTransactions(request);
+    sendJson(req, res, 200, { data: { ...explorerTransactions, provider: 'bscscan', refreshedAt: Date.now() } });
     return;
   }
 
@@ -1858,7 +1949,7 @@ const SOGO_PAYMENT_NETWORK_LABELS = {
 };
 const SOGO_DEFAULT_STABLE_DECIMALS = 6;
 const SOGO_BILLS_PAYMENT_ASSETS = new Set(['USDC', 'USDT']);
-const SOGO_BILLS_PLATFORM_FEE_BPS = 50n;
+const SOGO_BILLS_PLATFORM_FEE_BPS = 200n;
 const SOGO_BPS_DENOMINATOR = 10000n;
 const ERC20_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const consumedSogoBillPaymentTxHashes = new Set();
@@ -2394,7 +2485,7 @@ async function verifySogoBillsStablePayment({ payment, quote }) {
     amount: decimalRawToString(totalRawAmount, configuredDecimals),
     billAmount: decimalRawToString(billRawAmount, configuredDecimals),
     platformFeeAmount: decimalRawToString(platformFeeRawAmount, configuredDecimals),
-    platformFeeRate: '0.5%',
+    platformFeeRate: '2%',
   };
 }
 

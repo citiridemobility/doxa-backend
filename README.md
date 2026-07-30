@@ -25,7 +25,7 @@ Flow:
 ```txt
 Doxa app -> GET /sogo/bills/catalog and /sogo/bills/data-plans
 Doxa app -> GET /sogo/bills/quote?amount=500&asset=USDC -> signed stablecoin quote
-Doxa wallet sends quoted USDC or USDT plus the Doxa platform fee to the configured treasury wallet
+Doxa wallet sends quoted USDC or USDT plus the 2% Doxa platform fee to the configured treasury wallet
 Doxa app -> POST /sogo/bills/pay -> backend verifies the stablecoin transfer on-chain, then submits the bill payment
 ```
 
@@ -96,12 +96,15 @@ Routes:
 ```txt
 GET /history/health
 GET /history/alchemy-transfers?walletAddress=0x...&networkId=bnb-chain
+GET /history/explorer-transactions?walletAddress=0x...&networkId=bnb-chain
 ```
 
 Backend env:
 
 ```env
 ALCHEMY_API_KEY=your_alchemy_api_key
+# Optional but recommended for BNB Chain account-history fallback.
+BSCSCAN_API_KEY=your_bscscan_api_key
 ```
 
 Expo app env:

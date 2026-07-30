@@ -37,8 +37,14 @@ const MARKET_CHART_RANGE_CONFIG = {
   '1W': { coinGeckoDays: '7', timeframe: 'hour', aggregate: 4, limit: 64, ttlMs: 5 * 60 * 1000 },
   '1M': { coinGeckoDays: '30', timeframe: 'day', aggregate: 1, limit: 60, ttlMs: 10 * 60 * 1000 },
   '1Y': { coinGeckoDays: '365', timeframe: 'day', aggregate: 1, limit: 365, ttlMs: 60 * 60 * 1000 },
-  All: { coinGeckoDays: 'max', timeframe: 'day', aggregate: 1, limit: 1000, ttlMs: 6 * 60 * 60 * 1000 },
+  All: { coinGeckoDays: '3650', timeframe: 'day', aggregate: 1, limit: 1000, ttlMs: 6 * 60 * 60 * 1000 },
 };
+const MARKET_CHART_FALLBACK_RANGES = {
+  '1H': ['1D'],
+  All: ['1Y', '1M'],
+};
+const MARKET_STABLE_SYMBOLS = new Set(['USDC', 'USDT', 'DAI', 'BUSD']);
+const MARKET_STABLE_COIN_IDS = new Set(['usd-coin', 'tether', 'dai', 'binance-usd']);
 const MARKET_PLATFORM_BY_NETWORK = {
   'bnb-chain': 'binance-smart-chain',
   ethereum: 'ethereum',
@@ -92,9 +98,39 @@ const MARKET_NATIVE_COIN_ID_BY_NETWORK = {
   zksync: 'ethereum',
   scroll: 'ethereum',
 };
+const MARKET_WRAPPED_NATIVE_BY_NETWORK = {
+  'bnb-chain': '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c',
+  ethereum: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2',
+  base: '0x4200000000000000000000000000000000000006',
+  optimism: '0x4200000000000000000000000000000000000006',
+  arbitrum: '0x82af49447d8a07e3bd95bd0d56f35241523fbab1',
+  avalanche: '0xb31f66aa3c1e785363f0875a1b74e27b85fd66c7',
+};
 const MARKET_COIN_ID_BY_PLATFORM_CONTRACT = {
   'binance-smart-chain': {
+    '0x55d398326f99059ff775485246999027b3197955': 'tether',
+    '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d': 'usd-coin',
     '0x6ec90334d89dbdc89e08a133271be3d104128edb': 'wiki-cat',
+  },
+  ethereum: {
+    '0xdac17f958d2ee523a2206206994597c13d831ec7': 'tether',
+    '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48': 'usd-coin',
+  },
+  base: {
+    '0xfde4c96c8593536e31f229ea8f37b2ada2699bb2': 'tether',
+    '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913': 'usd-coin',
+  },
+  'arbitrum-one': {
+    '0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9': 'tether',
+    '0xaf88d065e77c8cc2239327c5edb3a432268e5831': 'usd-coin',
+  },
+};
+const MARKET_KNOWN_CHART_POOLS_BY_ONCHAIN_NETWORK_CONTRACT = {
+  bsc: {
+    '0x72928a49c4e88f382b0b6ff3e561f56dd75485f9': {
+      poolAddress: '0x3e93fec6e3ae5940dac4869acf5178bd30f4fc04',
+      tokenParam: 'base',
+    },
   },
 };
 const marketChartCache = new Map();
@@ -448,6 +484,35 @@ function normalizeMarketChartPoints(points, range) {
   return sortedPoints.slice(-Math.max(MARKET_CHART_RANGE_CONFIG[range].limit, minimumPoints));
 }
 
+function getMarketRangeDurationMs(range) {
+  switch (range) {
+    case '1H': return 60 * 60 * 1000;
+    case '1D': return 24 * 60 * 60 * 1000;
+    case '1W': return 7 * 24 * 60 * 60 * 1000;
+    case '1M': return 30 * 24 * 60 * 60 * 1000;
+    case '1Y': return 365 * 24 * 60 * 60 * 1000;
+    case 'All': return 3650 * 24 * 60 * 60 * 1000;
+    default: return 24 * 60 * 60 * 1000;
+  }
+}
+
+function buildMarketPriceLineChart(range, price) {
+  const configForRange = MARKET_CHART_RANGE_CONFIG[range] || MARKET_CHART_RANGE_CONFIG['1D'];
+  const count = Math.max(2, Math.min(configForRange.limit || 48, range === 'All' ? 365 : 96));
+  const now = Date.now();
+  const durationMs = getMarketRangeDurationMs(range);
+  const stepMs = durationMs / Math.max(count - 1, 1);
+
+  return Array.from({ length: count }, (_, index) => ({
+    timestamp: Math.round(now - durationMs + stepMs * index),
+    price,
+  }));
+}
+
+function isMarketStablecoinRequest(request, coinId) {
+  return MARKET_STABLE_SYMBOLS.has(request.symbol) || (coinId ? MARKET_STABLE_COIN_IDS.has(coinId) : false);
+}
+
 function getCoinGeckoChartPoints(payload, range) {
   const prices = Array.isArray(payload?.prices) ? payload.prices : [];
   const points = [];
@@ -577,6 +642,12 @@ async function fetchMarketCoinChart(coinId, range, currency) {
   return points.length >= 2 ? points : null;
 }
 
+async function fetchMarketSimplePrice(coinId, currency) {
+  const payload = await requestCoinGecko(`/simple/price?ids=${encodeURIComponent(coinId)}&vs_currencies=${encodeURIComponent(currency)}`);
+  const price = parseMarketNumber(asMarketRecord(payload?.[coinId])?.[currency]);
+  return price !== null && price > 0 ? price : null;
+}
+
 async function fetchMarketContractChart(platformId, contractAddress, range, currency) {
   const configForRange = MARKET_CHART_RANGE_CONFIG[range];
   const payload = await requestCoinGecko(`/coins/${encodeURIComponent(platformId)}/contract/${encodeURIComponent(contractAddress)}/market_chart?vs_currency=${encodeURIComponent(currency)}&days=${encodeURIComponent(configForRange.coinGeckoDays)}`);
@@ -596,6 +667,12 @@ async function requestGeckoTerminal(path) {
 }
 
 async function fetchGeckoTerminalTopPool(networkId, contractAddress) {
+  const knownPool = MARKET_KNOWN_CHART_POOLS_BY_ONCHAIN_NETWORK_CONTRACT[networkId]?.[contractAddress];
+
+  if (knownPool) {
+    return knownPool;
+  }
+
   try {
     const tokenPayload = await requestGeckoTerminal(`/networks/${encodeURIComponent(networkId)}/tokens/${encodeURIComponent(contractAddress)}?include=top_pools`);
     const tokenTopPool = getTopMarketPool(tokenPayload, contractAddress);
@@ -618,11 +695,7 @@ async function fetchGeckoTerminalMarketChart(networkId, contractAddress, range) 
   return points.length >= 2 ? points : null;
 }
 
-async function getMarketChart(request) {
-  const cacheKey = getMarketCacheKey(request);
-  const cached = getCachedMarketChart(cacheKey, request.range);
-  if (cached) return cached;
-
+async function getMarketChartFromProviders(request, range) {
   const platformId = getMarketPlatformId(request.networkId);
   const onchainNetworkId = getMarketOnchainNetworkId(request.networkId, request.evmChainId);
   const providers = [];
@@ -630,25 +703,27 @@ async function getMarketChart(request) {
 
   if (coinId) {
     providers.push(async () => {
-      const points = await fetchMarketCoinChart(coinId, request.range, request.currency);
+      const points = await fetchMarketCoinChart(coinId, range, request.currency);
       return points ? { points, provider: 'coingecko' } : null;
     });
   }
 
   if (request.contractAddress && platformId) {
     providers.push(async () => {
-      const points = await fetchMarketContractChart(platformId, request.contractAddress, request.range, request.currency);
+      const points = await fetchMarketContractChart(platformId, request.contractAddress, range, request.currency);
       return points ? { points, provider: 'coingecko-contract' } : null;
     });
   }
 
-  if (request.contractAddress && onchainNetworkId) {
+  const chartContractAddress = request.contractAddress || MARKET_WRAPPED_NATIVE_BY_NETWORK[request.networkId] || '';
+
+  if (chartContractAddress && onchainNetworkId) {
     providers.push(async () => {
-      const points = await fetchMarketOnchainTokenChart(onchainNetworkId, request.contractAddress, request.range);
+      const points = await fetchMarketOnchainTokenChart(onchainNetworkId, chartContractAddress, range);
       return points ? { points, provider: 'coingecko-onchain' } : null;
     });
     providers.push(async () => {
-      const points = await fetchGeckoTerminalMarketChart(onchainNetworkId, request.contractAddress, request.range);
+      const points = await fetchGeckoTerminalMarketChart(onchainNetworkId, chartContractAddress, range);
       return points ? { points, provider: 'geckoterminal' } : null;
     });
   }
@@ -656,11 +731,7 @@ async function getMarketChart(request) {
   for (const provider of providers) {
     try {
       const result = await provider();
-      if (!result) continue;
-
-      const data = { ...result, cached: false, refreshedAt: Date.now() };
-      cacheMarketChart(cacheKey, data);
-      return data;
+      if (result) return result;
     } catch (error) {
       if (!(error instanceof HttpError) || ![401, 403, 404, 429].includes(error.status)) {
         console.warn('Market chart provider failed', { message: error instanceof Error ? error.message : String(error) });
@@ -668,8 +739,66 @@ async function getMarketChart(request) {
     }
   }
 
+  return null;
+}
+
+async function getMarketFallbackChartPrice(request) {
+  const directPrice = parseMarketNumber(request.currentPrice);
+  if (directPrice !== null && directPrice > 0) return directPrice;
+
+  const coinId = getMarketCoinId(request);
+  if (coinId) {
+    try {
+      const simplePrice = await fetchMarketSimplePrice(coinId, request.currency);
+      if (simplePrice !== null) return simplePrice;
+    } catch {
+      // Stablecoins can still render an honest flat peg line when price APIs are unavailable.
+    }
+  }
+
+  if (isMarketStablecoinRequest(request, coinId) && request.currency === 'usd') {
+    return 1;
+  }
+
+  return null;
+}
+
+async function getMarketChart(request) {
+  const cacheKey = getMarketCacheKey(request);
+  const cached = getCachedMarketChart(cacheKey, request.range);
+  if (cached) return cached;
+
+  const rangesToTry = [request.range, ...(MARKET_CHART_FALLBACK_RANGES[request.range] || [])];
+
+  for (const range of rangesToTry) {
+    const result = await getMarketChartFromProviders(request, range);
+    if (!result) continue;
+
+    const data = {
+      ...result,
+      points: range === request.range ? result.points : normalizeMarketChartPoints(result.points, request.range),
+      cached: false,
+      refreshedAt: Date.now(),
+    };
+    cacheMarketChart(cacheKey, data);
+    return data;
+  }
+
   const stale = getCachedMarketChart(cacheKey, request.range, true);
   if (stale) return stale;
+
+  const fallbackPrice = await getMarketFallbackChartPrice(request);
+  if (fallbackPrice !== null) {
+    const data = {
+      points: buildMarketPriceLineChart(request.range, fallbackPrice),
+      provider: 'doxa-market',
+      cached: false,
+      refreshedAt: Date.now(),
+    };
+    cacheMarketChart(cacheKey, data);
+    return data;
+  }
+
   throw new HttpError(503, 'market_chart_unavailable', 'Live chart data is temporarily unavailable.');
 }
 
@@ -703,6 +832,7 @@ async function handleMarketProxy(req, res, url) {
       currency: normalizeMarketCurrency(url.searchParams.get('currency')),
       contractAddress: normalizeMarketAddress(url.searchParams.get('contractAddress')),
       evmChainId: normalizeMarketEvmChainId(url.searchParams.get('evmChainId')),
+      currentPrice: parseMarketNumber(url.searchParams.get('currentPrice')),
     };
     const chart = await getMarketChart(request);
     sendJson(req, res, 200, { data: chart });

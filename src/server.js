@@ -103,6 +103,9 @@ const HISTORY_ALCHEMY_NETWORK_BY_RECEIVE_NETWORK = {
   scroll: 'scroll-mainnet',
 };
 const HISTORY_TRANSFER_CATEGORIES = ['external', 'internal', 'erc20', 'erc721', 'erc1155', 'specialnft'];
+const HISTORY_ALCHEMY_TRANSFER_CATEGORIES_BY_NETWORK = {
+  'bnb-chain': ['external', 'erc20', 'erc721', 'erc1155', 'specialnft'],
+};
 const HISTORY_PAGE_SIZE_HEX = '0x64';
 const HISTORY_MAX_PAGES_PER_DIRECTION = 3;
 const HISTORY_DIRECTIONS = new Set(['incoming', 'outgoing']);
@@ -1134,12 +1137,13 @@ async function requestAlchemyHistoryTransfers({ apiKey, walletAddress, networkId
   const transfers = [];
   let pageKey;
   let pageCount = 0;
+  const categories = HISTORY_ALCHEMY_TRANSFER_CATEGORIES_BY_NETWORK[networkId] ?? HISTORY_TRANSFER_CATEGORIES;
 
   do {
     const transferParams = {
       fromBlock: '0x0',
       toBlock: 'latest',
-      category: HISTORY_TRANSFER_CATEGORIES,
+      category: categories,
       withMetadata: true,
       excludeZeroValue: true,
       maxCount: HISTORY_PAGE_SIZE_HEX,
@@ -1210,26 +1214,34 @@ function getEtherscanHistoryApiUrl(action, walletAddress, networkId) {
     throw new HttpError(500, 'history_provider_failed', 'Unsupported history network.');
   }
 
-  const query = {
-    chainid: String(chainId),
-    module: 'account',
-    action,
-    address: walletAddress,
-    startblock: '0',
-    endblock: '99999999',
-    page: '1',
-    offset: HISTORY_EXPLORER_PAGE_SIZE,
-    sort: 'desc',
-    apikey: getBscScanHistoryApiKey(),
-  };
+  const url = new URL(HISTORY_ETHERSCAN_V2_API_URL);
+  url.searchParams.set('chainid', String(chainId));
 
-  return `${HISTORY_ETHERSCAN_V2_API_URL}?${buildHistoryQueryString(query)}`;
+  return {
+    url: url.toString(),
+    body: buildHistoryQueryString({
+      module: 'account',
+      action,
+      address: walletAddress,
+      startblock: '0',
+      endblock: '99999999',
+      page: '1',
+      offset: HISTORY_EXPLORER_PAGE_SIZE,
+      sort: 'desc',
+      apikey: getBscScanHistoryApiKey(),
+    }),
+  };
 }
 
 async function requestBscScanHistoryList(action, walletAddress, networkId) {
-  const response = await fetch(getEtherscanHistoryApiUrl(action, walletAddress, networkId), {
-    method: 'GET',
-    headers: { Accept: 'application/json' },
+  const { url, body } = getEtherscanHistoryApiUrl(action, walletAddress, networkId);
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body,
   });
   const payload = await readResponseJson(response);
 
@@ -1241,12 +1253,13 @@ async function requestBscScanHistoryList(action, walletAddress, networkId) {
     return payload.result;
   }
 
-  const message = `${payload?.message || ''} ${payload?.result || ''}`.toLowerCase();
-  if (message.includes('no transactions')) {
+  const providerMessage = `${payload?.message || ''} ${payload?.result || ''}`.toLowerCase();
+  if (providerMessage.includes('no transactions')) {
     return [];
   }
 
-  if (payload?.message === 'Free API access is not supported for this chain.') {
+  if (providerMessage.includes('free api access is not supported for this chain') ||
+      providerMessage.includes('deprecated v1 endpoint')) {
     throw new HttpError(502, 'history_provider_failed', 'Transaction history is temporarily unavailable.');
   }
 

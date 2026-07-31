@@ -107,6 +107,10 @@ const HISTORY_PAGE_SIZE_HEX = '0x64';
 const HISTORY_MAX_PAGES_PER_DIRECTION = 3;
 const HISTORY_DIRECTIONS = new Set(['incoming', 'outgoing']);
 const HISTORY_BSCSCAN_API_URL = 'https://api.bscscan.com/api';
+const HISTORY_ETHERSCAN_V2_API_URL = 'https://api.etherscan.io/v2/api';
+const HISTORY_ETHERSCAN_V2_CHAIN_ID_BY_NETWORK = {
+  'bnb-chain': 56,
+};
 const HISTORY_EXPLORER_NETWORKS = new Set(['bnb-chain']);
 const HISTORY_EXPLORER_PAGE_SIZE = '100';
 const MARKET_COIN_ID_BY_SYMBOL = {
@@ -1200,8 +1204,14 @@ function getBscScanHistoryApiKey() {
   return apiKey;
 }
 
-async function requestBscScanHistoryList(action, walletAddress) {
+function getEtherscanHistoryApiUrl(action, walletAddress, networkId) {
+  const chainId = HISTORY_ETHERSCAN_V2_CHAIN_ID_BY_NETWORK[networkId];
+  if (!chainId) {
+    throw new HttpError(500, 'history_provider_failed', 'Unsupported history network.');
+  }
+
   const query = {
+    chainid: String(chainId),
     module: 'account',
     action,
     address: walletAddress,
@@ -1210,11 +1220,14 @@ async function requestBscScanHistoryList(action, walletAddress) {
     page: '1',
     offset: HISTORY_EXPLORER_PAGE_SIZE,
     sort: 'desc',
+    apikey: getBscScanHistoryApiKey(),
   };
-  const apiKey = getBscScanHistoryApiKey();
-  if (apiKey) query.apikey = apiKey;
 
-  const response = await fetch(`${HISTORY_BSCSCAN_API_URL}?${buildHistoryQueryString(query)}`, {
+  return `${HISTORY_ETHERSCAN_V2_API_URL}?${buildHistoryQueryString(query)}`;
+}
+
+async function requestBscScanHistoryList(action, walletAddress, networkId) {
+  const response = await fetch(getEtherscanHistoryApiUrl(action, walletAddress, networkId), {
     method: 'GET',
     headers: { Accept: 'application/json' },
   });
@@ -1233,6 +1246,10 @@ async function requestBscScanHistoryList(action, walletAddress) {
     return [];
   }
 
+  if (payload?.message === 'Free API access is not supported for this chain.') {
+    throw new HttpError(502, 'history_provider_failed', 'Transaction history is temporarily unavailable.');
+  }
+
   throw new HttpError(502, 'history_provider_failed', 'Transaction history is temporarily unavailable.');
 }
 
@@ -1243,8 +1260,8 @@ async function getExplorerHistoryTransactions(request) {
   }
 
   const [tokenTransfers, nativeTransactions] = await Promise.all([
-    requestBscScanHistoryList('tokentx', request.walletAddress),
-    requestBscScanHistoryList('txlist', request.walletAddress),
+    requestBscScanHistoryList('tokentx', request.walletAddress, networkId),
+    requestBscScanHistoryList('txlist', request.walletAddress, networkId),
   ]);
 
   return { tokenTransfers, nativeTransactions };

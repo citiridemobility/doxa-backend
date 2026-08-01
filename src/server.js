@@ -3107,6 +3107,32 @@ async function handleAnalyticsProxy(req, res, url) {
     return;
   }
 
+  if (req.method === 'GET' && segments.length === 0) {
+    sendJson(req, res, 200, {
+      status: 'ok',
+      message: 'Doxa notifications endpoint is active.',
+      routes: [
+        'POST /notifications/price-alerts/register',
+        'POST /notifications/devices/disable',
+        'POST /notifications/price-alerts/dispatch',
+      ],
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && segments.length === 0) {
+    sendJson(req, res, 200, {
+      status: 'ok',
+      message: 'Doxa notifications endpoint is active.',
+      routes: [
+        'POST /notifications/price-alerts/register',
+        'POST /notifications/devices/disable',
+        'POST /notifications/price-alerts/dispatch',
+      ],
+    });
+    return;
+  }
+
   if (req.method === 'POST' && segments.length === 1 && segments[0] === 'wallets') {
     const record = sanitizeWalletAnalyticsBody(await readJson(req));
     const payload = await upsertSupabaseRecord('doxa_wallet_creations', record, 'wallet_address');

@@ -33,7 +33,7 @@ const MARKET_PLATFORM_BY_NETWORK = {
   ethereum: 'ethereum',
   base: 'base',
   optimism: 'optimistic-ethereum',
-  'arbitrum-one': 'arbitrum-one',
+  arbitrum: 'arbitrum-one',
   avalanche: 'avalanche',
   linea: 'linea',
   zksync: 'zksync',
@@ -53,12 +53,13 @@ const MARKET_NATIVE_COIN_ID_BY_NETWORK = {
   'bnb-chain': 'binancecoin',
   ethereum: 'ethereum',
   base: 'ethereum',
-  optimism: 'optimistic-ethereum',
-  'arbitrum-one': 'arbitrum',
+  optimism: 'ethereum',
+  arbitrum: 'ethereum',
+  'arbitrum-one': 'ethereum',
   avalanche: 'avalanche-2',
   linea: 'ethereum',
-  zksync: 'zksync',
-  scroll: 'scroll',
+  zksync: 'ethereum',
+  scroll: 'ethereum',
 };
 
 const MARKET_COIN_ID_BY_PLATFORM_CONTRACT = {

@@ -6,7 +6,9 @@
     "scripts":  {
                     "start":  "node src/server.js",
                     "dev":  "node --watch src/server.js",
-                    "check":  "node --check src/server.js"
+                    "check":  "node --check src/server.js",
+                    "run-price-alerts": "node src/price-alerts-runner.js",
+                    "process-dispatch-queue": "node src/price-alerts-worker.js"
                 },
     "engines":  {
                     "node":  "22.x"

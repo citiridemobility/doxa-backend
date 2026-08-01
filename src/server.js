@@ -278,6 +278,7 @@ const config = {
   bscScanApiKey: cleanEnvValue(process.env.BSCSCAN_API_KEY || process.env.BSCSCAN_API_TOKEN || process.env.BSC_SCAN_API_KEY, 'BSCSCAN_API_KEY'),
   supabaseUrl: normalizeSupabaseUrl(process.env.SUPABASE_URL),
   supabaseServiceRoleKey: cleanEnvValue(process.env.SUPABASE_SERVICE_ROLE_KEY, 'SUPABASE_SERVICE_ROLE_KEY'),
+  notificationsCronSecret: cleanEnvValue(process.env.DOXA_NOTIFICATIONS_CRON_SECRET, 'DOXA_NOTIFICATIONS_CRON_SECRET'),
   sogoApiBaseUrl: normalizeSogoApiBaseUrl(process.env.SOGO_API_BASE_URL),
   sogoApiKey: cleanEnvValue(process.env.SOGO_API_KEY, 'SOGO_API_KEY'),
   sogoBillsQuoteSecret: cleanEnvValue(process.env.SOGO_BILLS_QUOTE_SECRET, 'SOGO_BILLS_QUOTE_SECRET'),
@@ -3122,6 +3123,124 @@ async function handleAnalyticsProxy(req, res, url) {
 
   throw new HttpError(404, 'not_found', 'Analytics route not found.');
 }
+
+function getNotificationsRouteSegments(url) {
+  const segments = url.pathname.split('/').filter(Boolean);
+  if (segments[0] === 'api') segments.shift();
+  if (segments[0] === 'notifications') segments.shift();
+  return segments;
+}
+
+function assertNotificationsRunnerSecret(req) {
+  if (!config.notificationsCronSecret) {
+    throw new HttpError(500, 'notifications_runner_not_configured', 'Set DOXA_NOTIFICATIONS_CRON_SECRET on the backend.');
+  }
+
+  const headerValue = String(req.headers['x-doxa-notifications-cron-secret'] || '');
+  const expected = Buffer.from(config.notificationsCronSecret);
+  const actual = Buffer.from(headerValue);
+
+  if (!headerValue || actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
+    throw new HttpError(403, 'notifications_runner_forbidden', 'Invalid cron secret for Doxa notifications runner.');
+  }
+}
+
+function sanitizeNotificationString(value) {
+  return String(value || '').trim();
+}
+
+async function sendExpoPushNotification(message) {
+  const response = await fetch('https://exp.host/--/api/v2/push/send', {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(message),
+  });
+
+  const payload = await readResponseJson(response);
+  if (!response.ok) {
+    console.error('Expo push notification failed', { status: response.status, payload, message });
+    throw new HttpError(502, 'expo_push_failed', 'Failed to send push notification through Expo.');
+  }
+
+  return payload;
+}
+
+async function handleNotificationsProxy(req, res, url) {
+  assertCors(req);
+  const segments = getNotificationsRouteSegments(url);
+
+  if (req.method === 'POST' && segments.length === 2 && segments[0] === 'price-alerts' && segments[1] === 'register') {
+    const body = await readJson(req);
+    const expoPushToken = sanitizeNotificationString(body.expoPushToken);
+    if (!expoPushToken) {
+      throw new HttpError(400, 'invalid_request', 'expoPushToken is required.');
+    }
+
+    const record = {
+      expo_push_token: expoPushToken,
+      wallet_address: sanitizeNotificationString(body.walletAddress),
+      platform: sanitizeNotificationString(body.platform),
+      app_version: sanitizeNotificationString(body.appVersion),
+      currency: sanitizeNotificationString(body.currency).toUpperCase() || 'USD',
+      tokens: Array.isArray(body.tokens) ? body.tokens : [],
+      enabled: true,
+      last_registered_at: new Date().toISOString(),
+      last_updated_at: new Date().toISOString(),
+    };
+
+    const payload = await upsertSupabaseRecord('doxa_notification_devices', record, 'expo_push_token');
+    sendJson(req, res, 200, { status: 'ok', data: payload });
+    return;
+  }
+
+  if (req.method === 'POST' && segments.length === 2 && segments[0] === 'devices' && segments[1] === 'disable') {
+    const body = await readJson(req);
+    const expoPushToken = sanitizeNotificationString(body.expoPushToken);
+    if (!expoPushToken) {
+      throw new HttpError(400, 'invalid_request', 'expoPushToken is required.');
+    }
+
+    const record = {
+      expo_push_token: expoPushToken,
+      wallet_address: sanitizeNotificationString(body.walletAddress),
+      enabled: false,
+      last_updated_at: new Date().toISOString(),
+    };
+
+    const payload = await upsertSupabaseRecord('doxa_notification_devices', record, 'expo_push_token');
+    sendJson(req, res, 200, { status: 'ok', data: payload });
+    return;
+  }
+
+  if (req.method === 'POST' && segments.length === 2 && segments[0] === 'price-alerts' && segments[1] === 'dispatch') {
+    assertNotificationsRunnerSecret(req);
+    const body = await readJson(req);
+    const messages = Array.isArray(body.messages) ? body.messages : [];
+    if (!messages.length) {
+      throw new HttpError(400, 'invalid_request', 'Expected an array of Expo push messages.');
+    }
+
+    const results = await Promise.all(messages.map(async (message) => {
+      const payload = {
+        to: sanitizeNotificationString(message.to),
+        title: sanitizeNotificationString(message.title),
+        body: sanitizeNotificationString(message.body),
+        data: message.data || {},
+        sound: 'default',
+        ...(message.channelId ? { channelId: sanitizeNotificationString(message.channelId) } : {}),
+      };
+      return sendExpoPushNotification(payload);
+    }));
+
+    sendJson(req, res, 200, { status: 'ok', delivered: results.length, results });
+    return;
+  }
+
+  throw new HttpError(404, 'not_found', 'Notifications route not found.');
+}
 function handleError(req, res, error) {
   const status = error instanceof HttpError ? error.status : 500;
   const code = error instanceof HttpError ? error.code : 'internal_error';
@@ -3139,6 +3258,7 @@ export async function handleRequest(req, res) {
     const isPaycrestRoute = url.pathname === '/paycrest' || url.pathname.startsWith('/paycrest/') || url.pathname === '/api/paycrest' || url.pathname.startsWith('/api/paycrest/');
     const isSogoRoute = url.pathname === '/sogo' || url.pathname.startsWith('/sogo/') || url.pathname === '/api/sogo' || url.pathname.startsWith('/api/sogo/');
     const isAnalyticsRoute = url.pathname === '/analytics' || url.pathname.startsWith('/analytics/') || url.pathname === '/api/analytics' || url.pathname.startsWith('/api/analytics/');
+    const isNotificationsRoute = url.pathname === '/notifications' || url.pathname.startsWith('/notifications/') || url.pathname === '/api/notifications' || url.pathname.startsWith('/api/notifications/');
     const isMarketRoute = url.pathname === '/market' || url.pathname.startsWith('/market/') || url.pathname === '/api/market' || url.pathname.startsWith('/api/market/');
     const isHistoryRoute = url.pathname === '/history' || url.pathname.startsWith('/history/') || url.pathname === '/api/history' || url.pathname.startsWith('/api/history/');
 
@@ -3172,6 +3292,11 @@ export async function handleRequest(req, res) {
 
     if (isAnalyticsRoute) {
       await handleAnalyticsProxy(req, res, url);
+      return;
+    }
+
+    if (isNotificationsRoute) {
+      await handleNotificationsProxy(req, res, url);
       return;
     }
 

@@ -140,6 +140,32 @@ POST /analytics/transactions
 
 Only non-custodial metrics are sent. The app never sends seed phrases, private keys, wallet passwords, biometric data, or raw authentication material to the backend. RLS is enabled on the metrics tables; `anon` and `authenticated` are revoked, and only the backend `service_role` can insert/update/read metrics through explicit policies.
 
+## Notifications Proxy
+
+The app can register Expo push tokens and remote price alert preferences through the backend.
+
+Required backend env:
+
+```env
+DOXA_NOTIFICATIONS_CRON_SECRET=your_long_random_notifications_cron_secret_here
+```
+
+Expo app env:
+
+```env
+EXPO_PUBLIC_DOXA_NOTIFICATIONS_ENDPOINT=https://your-backend-domain/notifications
+```
+
+Routes:
+
+```txt
+POST /notifications/price-alerts/register
+POST /notifications/devices/disable
+POST /notifications/price-alerts/dispatch
+```
+
+The dispatch route is protected by `X-DOXA-NOTIFICATIONS-CRON-SECRET` and is intended for server-side cron runners only.
+
 ## Local
 ```bash
 npm run backend

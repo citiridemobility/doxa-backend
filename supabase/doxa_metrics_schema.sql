@@ -141,3 +141,33 @@ revoke all on public.doxa_transaction_status_summary from anon, authenticated;
 grant select on public.doxa_daily_wallet_creations to service_role;
 grant select on public.doxa_daily_transaction_volume to service_role;
 grant select on public.doxa_transaction_status_summary to service_role;
+
+create table if not exists public.doxa_notification_devices (
+  id uuid primary key default gen_random_uuid(),
+  expo_push_token text not null,
+  wallet_address text,
+  platform text,
+  app_version text,
+  currency text not null default 'USD',
+  tokens jsonb not null default '[]'::jsonb,
+  enabled boolean not null default true,
+  last_registered_at timestamptz not null default now(),
+  last_updated_at timestamptz not null default now(),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint doxa_notification_devices_push_token_unique unique (expo_push_token),
+  constraint doxa_notification_devices_wallet_address_format check (wallet_address is null or wallet_address ~* '^0x[a-f0-9]{40}$')
+);
+
+alter table public.doxa_notification_devices enable row level security;
+revoke all on public.doxa_notification_devices from anon, authenticated;
+
+grant select, insert, update on public.doxa_notification_devices to service_role;
+
+drop policy if exists doxa_notification_devices_service_role_manage on public.doxa_notification_devices;
+create policy doxa_notification_devices_service_role_manage
+on public.doxa_notification_devices
+for all
+to service_role
+using (true)
+with check (true);

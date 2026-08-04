@@ -683,6 +683,30 @@ async function fetchMarketCoinChart(coinId, range, currency) {
   return points.length >= 2 ? points : null;
 }
 
+async function getMarketCoinPrices(coinIds, currency) {
+  const result = {};
+
+  for (const coinIdChunk of chunkMarketItems(coinIds)) {
+    const idsString = coinIdChunk.map(encodeURIComponent).join(',');
+    const payload = await requestCoinGecko(
+      `/simple/price?ids=${idsString}&vs_currencies=${encodeURIComponent(currency)}&include_market_cap=false&include_24hr_vol=false&include_24hr_change=true`,
+    );
+
+    for (const coinId of coinIdChunk) {
+      const row = asMarketRecord(payload?.[coinId]);
+      const price = parseMarketNumber(row?.[currency]);
+      const change24h = parseMarketNumber(row?.[`${currency}_24h_change`]);
+
+      result[coinId] = {
+        price: price !== null && price > 0 ? price : null,
+        change24h,
+      };
+    }
+  }
+
+  return result;
+}
+
 async function fetchMarketSimplePrice(coinId, currency) {
   const payload = await requestCoinGecko(`/simple/price?ids=${encodeURIComponent(coinId)}&vs_currencies=${encodeURIComponent(currency)}`);
   const price = parseMarketNumber(asMarketRecord(payload?.[coinId])?.[currency]);
@@ -714,6 +738,15 @@ function normalizeMarketPlatformId(value) {
     throw new HttpError(400, 'invalid_market_params', 'Market platform is invalid.');
   }
   return platformId;
+}
+
+function normalizeMarketCoinIdList(value) {
+  const coinIds = getMarketString(value)
+    .split(',')
+    .map((coinId) => coinId.trim().toLowerCase())
+    .filter((coinId) => /^[a-z0-9._-]{1,100}$/.test(coinId));
+
+  return Array.from(new Set(coinIds));
 }
 
 function normalizeMarketAddressList(value) {
@@ -1063,6 +1096,18 @@ async function handleMarketProxy(req, res, url) {
       service: 'doxa-market-proxy',
       configured: Boolean(config.coinGeckoApiKey || config.coinGeckoProApiKey),
     });
+    return;
+  }
+
+  if (req.method === 'GET' && segments.length === 1 && segments[0] === 'coin-prices') {
+    const coinIds = normalizeMarketCoinIdList(url.searchParams.get('ids'));
+    if (!coinIds.length) {
+      throw new HttpError(400, 'invalid_market_params', 'At least one coin id is required.');
+    }
+
+    const currency = normalizeMarketCurrency(url.searchParams.get('currency'));
+    const marketData = await getMarketCoinPrices(coinIds, currency);
+    sendJson(req, res, 200, { data: { marketData, refreshedAt: Date.now() } });
     return;
   }
 

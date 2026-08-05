@@ -102,9 +102,9 @@ const HISTORY_ALCHEMY_NETWORK_BY_RECEIVE_NETWORK = {
   zksync: 'zksync-mainnet',
   scroll: 'scroll-mainnet',
 };
-const HISTORY_TRANSFER_CATEGORIES = ['external', 'internal', 'erc20', 'erc721', 'erc1155', 'specialnft'];
+const HISTORY_TRANSFER_CATEGORIES = ['external', 'internal', 'erc20', 'erc721', 'erc1155'];
 const HISTORY_ALCHEMY_TRANSFER_CATEGORIES_BY_NETWORK = {
-  'bnb-chain': ['external', 'erc20', 'erc721', 'erc1155', 'specialnft'],
+  'bnb-chain': ['external', 'erc20', 'erc721', 'erc1155'],
 };
 const HISTORY_PAGE_SIZE_HEX = '0x64';
 const HISTORY_MAX_PAGES_PER_DIRECTION = 3;

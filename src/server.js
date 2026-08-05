@@ -104,17 +104,22 @@ const HISTORY_ALCHEMY_NETWORK_BY_RECEIVE_NETWORK = {
 };
 const HISTORY_TRANSFER_CATEGORIES = ['external', 'internal', 'erc20', 'erc721', 'erc1155'];
 const HISTORY_ALCHEMY_TRANSFER_CATEGORIES_BY_NETWORK = {
-  'bnb-chain': ['external', 'erc20', 'erc721', 'erc1155'],
+  'bnb-chain': ['external', 'erc20'],
 };
+const HISTORY_ALCHEMY_SUCCESS_CACHE_TTL_MS = 45 * 1000;
+const HISTORY_ALCHEMY_STALE_CACHE_TTL_MS = 10 * 60 * 1000;
+const HISTORY_ALCHEMY_RETRY_DELAY_MS = 750;
 const HISTORY_PAGE_SIZE_HEX = '0x64';
 const HISTORY_MAX_PAGES_PER_DIRECTION = 3;
 const HISTORY_DIRECTIONS = new Set(['incoming', 'outgoing']);
 const HISTORY_BSCSCAN_API_URL = 'https://api.bscscan.com/api';
 const HISTORY_ETHERSCAN_V2_API_URL = 'https://api.etherscan.io/v2/api';
 const HISTORY_ETHERSCAN_V2_CHAIN_ID_BY_NETWORK = {
+  ethereum: 1,
   'bnb-chain': 56,
+  base: 8453,
 };
-const HISTORY_EXPLORER_NETWORKS = new Set(['bnb-chain']);
+const HISTORY_EXPLORER_NETWORKS = new Set(['bnb-chain', 'ethereum', 'base']);
 const HISTORY_EXPLORER_PAGE_SIZE = '100';
 const MARKET_COIN_ID_BY_SYMBOL = {
   AVAX: 'avalanche-2',
@@ -275,6 +280,7 @@ const config = {
   geckoTerminalApiBaseUrl: cleanEnvValue(process.env.GECKOTERMINAL_API_BASE_URL || 'https://api.geckoterminal.com/api/v2', 'GECKOTERMINAL_API_BASE_URL').replace(/\/+$/, ''),
   dexScreenerApiBaseUrl: cleanEnvValue(process.env.DEXSCREENER_API_BASE_URL || 'https://api.dexscreener.com', 'DEXSCREENER_API_BASE_URL').replace(/\/+$/, ''),
   alchemyApiKey: cleanEnvValue(process.env.ALCHEMY_API_KEY || process.env.EXPO_PUBLIC_ALCHEMY_API_KEY || process.env.REACT_APP_ALCHEMY_API_KEY, 'ALCHEMY_API_KEY'),
+  etherscanApiKey: cleanEnvValue(process.env.ETHERSCAN_API_KEY || process.env.ETHERSCAN_API_TOKEN || process.env.EXPO_PUBLIC_ETHERSCAN_API_KEY || process.env.REACT_APP_ETHERSCAN_API_KEY, 'ETHERSCAN_API_KEY'),
   bscScanApiKey: cleanEnvValue(process.env.BSCSCAN_API_KEY || process.env.BSCSCAN_API_TOKEN || process.env.BSC_SCAN_API_KEY, 'BSCSCAN_API_KEY'),
   supabaseUrl: normalizeSupabaseUrl(process.env.SUPABASE_URL),
   supabaseServiceRoleKey: cleanEnvValue(process.env.SUPABASE_SERVICE_ROLE_KEY, 'SUPABASE_SERVICE_ROLE_KEY'),
@@ -1177,7 +1183,64 @@ function requireAlchemyHistoryApiKey() {
   return apiKey;
 }
 
-async function requestAlchemyHistoryTransfers({ apiKey, walletAddress, networkId, direction }) {
+const historyAlchemyTransferCache = new Map();
+const historyAlchemyTransferInflight = new Map();
+
+const wait = (durationMs) => new Promise((resolve) => setTimeout(resolve, durationMs));
+
+function getHistoryAlchemyCacheKey({ walletAddress, networkId, direction }) {
+  return `${networkId}:${direction}:${walletAddress.toLowerCase()}`;
+}
+
+function getRetryAfterMs(response) {
+  const retryAfter = Number(response.headers.get('retry-after'));
+  return Number.isFinite(retryAfter) && retryAfter > 0
+    ? Math.min(retryAfter * 1000, 5000)
+    : HISTORY_ALCHEMY_RETRY_DELAY_MS;
+}
+
+async function fetchAlchemyHistoryPage(endpoint, networkId, direction, pageCount, transferParams) {
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: `${networkId}-${direction}-${pageCount}`,
+      method: 'alchemy_getAssetTransfers',
+      params: [transferParams],
+    }),
+  });
+  const payload = await readResponseJson(response);
+
+  if (response.status === 429) {
+    await wait(getRetryAfterMs(response));
+    const retryResponse = await fetch(endpoint, {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: `${networkId}-${direction}-${pageCount}-retry`,
+        method: 'alchemy_getAssetTransfers',
+        params: [transferParams],
+      }),
+    });
+    const retryPayload = await readResponseJson(retryResponse);
+
+    if (!retryResponse.ok || retryPayload?.error) {
+      throw new HttpError(retryResponse.status || 502, 'history_provider_failed', 'Transaction history is temporarily unavailable.');
+    }
+
+    return retryPayload;
+  }
+
+  if (!response.ok || payload?.error) {
+    throw new HttpError(response.status || 502, 'history_provider_failed', 'Transaction history is temporarily unavailable.');
+  }
+
+  return payload;
+}
+
+async function requestAlchemyHistoryTransfersUncached({ apiKey, walletAddress, networkId, direction }) {
   const alchemyNetwork = HISTORY_ALCHEMY_NETWORK_BY_RECEIVE_NETWORK[networkId];
   const endpoint = `https://${alchemyNetwork}.g.alchemy.com/v2/${apiKey}`;
   const transfers = [];
@@ -1197,21 +1260,7 @@ async function requestAlchemyHistoryTransfers({ apiKey, walletAddress, networkId
       ...(direction === 'incoming' ? { toAddress: walletAddress } : { fromAddress: walletAddress }),
       ...(pageKey ? { pageKey } : {}),
     };
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: `${networkId}-${direction}-${pageCount}`,
-        method: 'alchemy_getAssetTransfers',
-        params: [transferParams],
-      }),
-    });
-    const payload = await readResponseJson(response);
-
-    if (!response.ok || payload?.error) {
-      throw new HttpError(response.status || 502, 'history_provider_failed', 'Transaction history is temporarily unavailable.');
-    }
+    const payload = await fetchAlchemyHistoryPage(endpoint, networkId, direction, pageCount, transferParams);
 
     transfers.push(...(Array.isArray(payload?.result?.transfers) ? payload.result.transfers : []));
     pageKey = payload?.result?.pageKey;
@@ -1221,12 +1270,47 @@ async function requestAlchemyHistoryTransfers({ apiKey, walletAddress, networkId
   return transfers;
 }
 
+async function requestAlchemyHistoryTransfers({ apiKey, walletAddress, networkId, direction }) {
+  const cacheKey = getHistoryAlchemyCacheKey({ walletAddress, networkId, direction });
+  const now = Date.now();
+  const cached = historyAlchemyTransferCache.get(cacheKey);
+
+  if (cached && now - cached.timestamp <= HISTORY_ALCHEMY_SUCCESS_CACHE_TTL_MS) {
+    return cached.transfers;
+  }
+
+  if (historyAlchemyTransferInflight.has(cacheKey)) {
+    return historyAlchemyTransferInflight.get(cacheKey);
+  }
+
+  const requestPromise = requestAlchemyHistoryTransfersUncached({ apiKey, walletAddress, networkId, direction })
+    .then((transfers) => {
+      historyAlchemyTransferCache.set(cacheKey, { transfers, timestamp: Date.now() });
+      return transfers;
+    })
+    .catch((error) => {
+      if (cached && now - cached.timestamp <= HISTORY_ALCHEMY_STALE_CACHE_TTL_MS) {
+        return cached.transfers;
+      }
+
+      throw error;
+    })
+    .finally(() => {
+      historyAlchemyTransferInflight.delete(cacheKey);
+    });
+
+  historyAlchemyTransferInflight.set(cacheKey, requestPromise);
+  return requestPromise;
+}
+
 async function getAlchemyHistoryTransfers(request) {
   const apiKey = requireAlchemyHistoryApiKey();
   const directions = request.direction ? [request.direction] : ['incoming', 'outgoing'];
-  const transferGroups = await Promise.all(
-    directions.map((direction) => requestAlchemyHistoryTransfers({ ...request, apiKey, direction })),
-  );
+  const transferGroups = [];
+
+  for (const direction of directions) {
+    transferGroups.push(await requestAlchemyHistoryTransfers({ ...request, apiKey, direction }));
+  }
 
   return transferGroups.flat();
 }
@@ -1254,40 +1338,47 @@ function getBscScanHistoryApiKey() {
   return apiKey;
 }
 
-function getEtherscanHistoryApiUrl(action, walletAddress, networkId) {
-  const chainId = HISTORY_ETHERSCAN_V2_CHAIN_ID_BY_NETWORK[networkId];
-  if (!chainId) {
-    throw new HttpError(500, 'history_provider_failed', 'Unsupported history network.');
+function getEtherscanHistoryApiKey() {
+  const apiKey = cleanEnvValue(config.etherscanApiKey, 'ETHERSCAN_API_KEY');
+  if (!apiKey || ['demo', 'docs-demo', 'YOUR_API_KEY', 'your_etherscan_api_key_here', 'your_etherscan_v2_api_key_here'].includes(apiKey)) {
+    return '';
   }
-
-  const url = new URL(HISTORY_ETHERSCAN_V2_API_URL);
-  url.searchParams.set('chainid', String(chainId));
-
-  return {
-    url: url.toString(),
-    body: buildHistoryQueryString({
-      module: 'account',
-      action,
-      address: walletAddress,
-      startblock: '0',
-      endblock: '99999999',
-      page: '1',
-      offset: HISTORY_EXPLORER_PAGE_SIZE,
-      sort: 'desc',
-      apikey: getBscScanHistoryApiKey(),
-    }),
-  };
+  return apiKey;
 }
 
-async function requestBscScanHistoryList(action, walletAddress, networkId) {
-  const { url, body } = getEtherscanHistoryApiUrl(action, walletAddress, networkId);
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Accept: 'application/json',
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body,
+function getExplorerHistoryApiUrl(action, walletAddress, networkId) {
+  const apiKey = networkId === 'bnb-chain' ? getBscScanHistoryApiKey() : getEtherscanHistoryApiKey();
+
+  if (!apiKey) {
+    throw new HttpError(503, 'history_provider_unconfigured', 'Transaction history is temporarily unavailable.');
+  }
+
+  const url = new URL(networkId === 'bnb-chain' ? HISTORY_BSCSCAN_API_URL : HISTORY_ETHERSCAN_V2_API_URL);
+  url.searchParams.set('module', 'account');
+  url.searchParams.set('action', action);
+  url.searchParams.set('address', walletAddress);
+  url.searchParams.set('startblock', '0');
+  url.searchParams.set('endblock', '99999999');
+  url.searchParams.set('page', '1');
+  url.searchParams.set('offset', HISTORY_EXPLORER_PAGE_SIZE);
+  url.searchParams.set('sort', 'desc');
+  url.searchParams.set('apikey', apiKey);
+
+  if (networkId !== 'bnb-chain') {
+    const chainId = HISTORY_ETHERSCAN_V2_CHAIN_ID_BY_NETWORK[networkId];
+    if (!chainId) {
+      throw new HttpError(500, 'history_provider_failed', 'Unsupported history network.');
+    }
+    url.searchParams.set('chainid', String(chainId));
+  }
+
+  return url.toString();
+}
+
+async function requestExplorerHistoryList(action, walletAddress, networkId) {
+  const response = await fetch(getExplorerHistoryApiUrl(action, walletAddress, networkId), {
+    method: 'GET',
+    headers: { Accept: 'application/json' },
   });
   const payload = await readResponseJson(response);
 
@@ -1314,13 +1405,9 @@ async function requestBscScanHistoryList(action, walletAddress, networkId) {
 
 async function getExplorerHistoryTransactions(request) {
   const networkId = normalizeHistoryExplorerNetworkId(request.networkId);
-  if (networkId !== 'bnb-chain') {
-    throw new HttpError(400, 'invalid_history_params', 'Explorer transaction history is not supported for this network yet.');
-  }
-
   const [tokenTransfers, nativeTransactions] = await Promise.all([
-    requestBscScanHistoryList('tokentx', request.walletAddress, networkId),
-    requestBscScanHistoryList('txlist', request.walletAddress, networkId),
+    requestExplorerHistoryList('tokentx', request.walletAddress, networkId),
+    requestExplorerHistoryList('txlist', request.walletAddress, networkId),
   ]);
 
   return { tokenTransfers, nativeTransactions };
@@ -1348,6 +1435,7 @@ async function handleHistoryProxy(req, res, url) {
       providers: {
         alchemy: Boolean(cleanEnvValue(config.alchemyApiKey, 'ALCHEMY_API_KEY')),
         bscscan: Boolean(getBscScanHistoryApiKey()),
+        etherscan: Boolean(getEtherscanHistoryApiKey()),
       },
     });
     return;

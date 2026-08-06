@@ -103,7 +103,7 @@ Backend env:
 
 ```env
 ALCHEMY_API_KEY=your_alchemy_api_key
-# Optional but recommended for BNB Chain account-history fallback.
+# Required for complete BNB Chain native + BEP-20 account history. Public RPC only covers recent BEP-20 logs.
 BSCSCAN_API_KEY=your_bscscan_api_key
 ```
 

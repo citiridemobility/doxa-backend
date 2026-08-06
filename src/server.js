@@ -116,11 +116,23 @@ const HISTORY_BSCSCAN_API_URL = 'https://api.bscscan.com/api';
 const HISTORY_ETHERSCAN_V2_API_URL = 'https://api.etherscan.io/v2/api';
 const HISTORY_ETHERSCAN_V2_CHAIN_ID_BY_NETWORK = {
   ethereum: 1,
-  'bnb-chain': 56,
-  base: 8453,
 };
-const HISTORY_EXPLORER_NETWORKS = new Set(['bnb-chain', 'ethereum', 'base']);
+const HISTORY_EXPLORER_NETWORKS = new Set(['bnb-chain', 'ethereum']);
 const HISTORY_EXPLORER_PAGE_SIZE = '100';
+const HISTORY_PUBLIC_RPC_NETWORKS = new Set(['bnb-chain', 'base']);
+const HISTORY_PUBLIC_RPC_DEFAULT_URLS_BY_NETWORK = {
+  'bnb-chain': ['https://bsc-dataseed.binance.org', 'https://bsc-rpc.publicnode.com', 'https://binance.llamarpc.com'],
+  base: ['https://mainnet.base.org', 'https://base-rpc.publicnode.com', 'https://base.llamarpc.com'],
+};
+const HISTORY_PUBLIC_RPC_DEFAULT_LOOKBACK_BLOCKS_BY_NETWORK = {
+  'bnb-chain': 80000,
+  base: 120000,
+};
+const HISTORY_PUBLIC_RPC_BLOCK_CHUNK_SIZE = 5000;
+const HISTORY_PUBLIC_RPC_MAX_LOGS = 150;
+const HISTORY_PUBLIC_RPC_SUCCESS_CACHE_TTL_MS = 60 * 1000;
+const HISTORY_PUBLIC_RPC_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const HISTORY_PUBLIC_RPC_ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 const MARKET_COIN_ID_BY_SYMBOL = {
   AVAX: 'avalanche-2',
   BNB: 'binancecoin',
@@ -1314,6 +1326,261 @@ async function getAlchemyHistoryTransfers(request) {
 
   return transferGroups.flat();
 }
+const historyPublicRpcTransferCache = new Map();
+const historyPublicRpcMetadataCache = new Map();
+const historyPublicRpcBlockCache = new Map();
+let historyPublicRpcRequestId = 1;
+
+function getConfiguredHistoryPublicRpcUrls(networkId) {
+  const envValue = networkId === 'bnb-chain'
+    ? cleanEnvValue(process.env.HISTORY_RPC_BNB_CHAIN_URLS || process.env.BSC_RPC_URLS || process.env.BSC_RPC_URL, 'HISTORY_RPC_BNB_CHAIN_URLS')
+    : cleanEnvValue(process.env.HISTORY_RPC_BASE_URLS || process.env.BASE_RPC_URLS || process.env.BASE_RPC_URL, 'HISTORY_RPC_BASE_URLS');
+  const configuredUrls = envValue
+    .split(',')
+    .map((url) => url.trim())
+    .filter(Boolean);
+
+  return Array.from(new Set([...configuredUrls, ...(HISTORY_PUBLIC_RPC_DEFAULT_URLS_BY_NETWORK[networkId] || [])]));
+}
+
+function getHistoryPublicRpcLookbackBlocks(networkId) {
+  const rawValue = networkId === 'bnb-chain'
+    ? process.env.HISTORY_RPC_BNB_CHAIN_LOOKBACK_BLOCKS
+    : process.env.HISTORY_RPC_BASE_LOOKBACK_BLOCKS;
+  const parsedValue = Number(cleanEnvValue(rawValue, 'HISTORY_RPC_LOOKBACK_BLOCKS'));
+
+  return Number.isFinite(parsedValue) && parsedValue > 0
+    ? Math.floor(parsedValue)
+    : HISTORY_PUBLIC_RPC_DEFAULT_LOOKBACK_BLOCKS_BY_NETWORK[networkId] || 80000;
+}
+
+function toRpcQuantity(value) {
+  return `0x${BigInt(value).toString(16)}`;
+}
+
+function parseRpcQuantity(value, fallback = 0) {
+  try {
+    return Number(BigInt(value || '0x0'));
+  } catch {
+    return fallback;
+  }
+}
+
+function padHistoryAddressTopic(address) {
+  return `0x${address.toLowerCase().replace(/^0x/, '').padStart(64, '0')}`;
+}
+
+function topicToHistoryAddress(topic) {
+  const normalizedTopic = String(topic || '').toLowerCase().replace(/^0x/, '');
+  return normalizedTopic.length >= 40 ? `0x${normalizedTopic.slice(-40)}` : HISTORY_PUBLIC_RPC_ZERO_ADDRESS;
+}
+
+function getHistoryRpcLogKey(log) {
+  return `${String(log?.transactionHash || '').toLowerCase()}:${String(log?.logIndex || '').toLowerCase()}`;
+}
+
+async function requestHistoryPublicRpc(networkId, method, params) {
+  const urls = getConfiguredHistoryPublicRpcUrls(networkId);
+  let firstError;
+
+  for (const url of urls) {
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: historyPublicRpcRequestId += 1,
+          method,
+          params,
+        }),
+      });
+      const payload = await readResponseJson(response);
+
+      if (!response.ok || payload?.error) {
+        throw new Error(payload?.error?.message || `RPC ${method} failed with ${response.status}`);
+      }
+
+      return payload?.result;
+    } catch (error) {
+      firstError = firstError || error;
+    }
+  }
+
+  console.warn('Public RPC history request failed', {
+    networkId,
+    method,
+    message: firstError instanceof Error ? firstError.message : String(firstError),
+  });
+  throw new HttpError(502, 'history_provider_failed', 'Transaction history is temporarily unavailable.');
+}
+
+async function getHistoryPublicRpcLatestBlock(networkId) {
+  return parseRpcQuantity(await requestHistoryPublicRpc(networkId, 'eth_blockNumber', []));
+}
+
+async function getHistoryPublicRpcBlockTimestamp(networkId, blockNumberHex) {
+  const cacheKey = `${networkId}:${String(blockNumberHex).toLowerCase()}`;
+
+  if (historyPublicRpcBlockCache.has(cacheKey)) {
+    return historyPublicRpcBlockCache.get(cacheKey);
+  }
+
+  try {
+    const block = await requestHistoryPublicRpc(networkId, 'eth_getBlockByNumber', [blockNumberHex, false]);
+    const timestampMs = parseRpcQuantity(block?.timestamp, Math.floor(Date.now() / 1000)) * 1000;
+    const isoTimestamp = new Date(timestampMs).toISOString();
+    historyPublicRpcBlockCache.set(cacheKey, isoTimestamp);
+    return isoTimestamp;
+  } catch {
+    return new Date().toISOString();
+  }
+}
+
+function decodeRpcAbiString(value) {
+  const hex = String(value || '').replace(/^0x/, '');
+  if (!hex || /^0+$/.test(hex)) return '';
+
+  try {
+    if (hex.length >= 128) {
+      const length = Number(BigInt(`0x${hex.slice(64, 128)}`));
+      const data = hex.slice(128, 128 + length * 2);
+      return Buffer.from(data, 'hex').toString('utf8').replace(/\0/g, '').trim();
+    }
+
+    return Buffer.from(hex.slice(0, 64), 'hex').toString('utf8').replace(/\0/g, '').trim();
+  } catch {
+    return '';
+  }
+}
+
+function decodeRpcUint(value, fallback = 18) {
+  try {
+    return Number(BigInt(value || '0x0'));
+  } catch {
+    return fallback;
+  }
+}
+
+async function getHistoryPublicRpcTokenMetadata(networkId, tokenAddress) {
+  const normalizedTokenAddress = String(tokenAddress || '').toLowerCase();
+  const cacheKey = `${networkId}:${normalizedTokenAddress}`;
+
+  if (historyPublicRpcMetadataCache.has(cacheKey)) {
+    return historyPublicRpcMetadataCache.get(cacheKey);
+  }
+
+  const call = async (data) => requestHistoryPublicRpc(networkId, 'eth_call', [{ to: normalizedTokenAddress, data }, 'latest']);
+  const metadata = { symbol: 'TOKEN', name: 'Token', decimals: 18 };
+
+  try {
+    metadata.symbol = decodeRpcAbiString(await call('0x95d89b41')) || metadata.symbol;
+  } catch {}
+
+  try {
+    metadata.name = decodeRpcAbiString(await call('0x06fdde03')) || metadata.symbol;
+  } catch {}
+
+  try {
+    metadata.decimals = decodeRpcUint(await call('0x313ce567'), 18);
+  } catch {}
+
+  historyPublicRpcMetadataCache.set(cacheKey, metadata);
+  return metadata;
+}
+
+async function getHistoryPublicRpcTransferLogs(request) {
+  const latestBlock = await getHistoryPublicRpcLatestBlock(request.networkId);
+  const lookbackBlocks = getHistoryPublicRpcLookbackBlocks(request.networkId);
+  const fromBlock = Math.max(0, latestBlock - lookbackBlocks);
+  const walletTopic = padHistoryAddressTopic(request.walletAddress);
+  const logsByKey = new Map();
+  let successfulLogRequests = 0;
+
+  for (let chunkEnd = latestBlock; chunkEnd >= fromBlock; chunkEnd -= HISTORY_PUBLIC_RPC_BLOCK_CHUNK_SIZE) {
+    const chunkStart = Math.max(fromBlock, chunkEnd - HISTORY_PUBLIC_RPC_BLOCK_CHUNK_SIZE + 1);
+    const fromBlockHex = toRpcQuantity(chunkStart);
+    const toBlockHex = toRpcQuantity(chunkEnd);
+    const filters = [
+      { fromBlock: fromBlockHex, toBlock: toBlockHex, topics: [HISTORY_PUBLIC_RPC_TRANSFER_TOPIC, walletTopic] },
+      { fromBlock: fromBlockHex, toBlock: toBlockHex, topics: [HISTORY_PUBLIC_RPC_TRANSFER_TOPIC, null, walletTopic] },
+    ];
+
+    for (const filter of filters) {
+      try {
+        const logs = await requestHistoryPublicRpc(request.networkId, 'eth_getLogs', [filter]);
+        successfulLogRequests += 1;
+        (Array.isArray(logs) ? logs : []).forEach((log) => {
+          const key = getHistoryRpcLogKey(log);
+          if (key && !logsByKey.has(key)) logsByKey.set(key, log);
+        });
+      } catch (error) {
+        console.warn('Public RPC log chunk failed', {
+          networkId: request.networkId,
+          fromBlock: fromBlockHex,
+          toBlock: toBlockHex,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    if (logsByKey.size >= HISTORY_PUBLIC_RPC_MAX_LOGS) {
+      break;
+    }
+  }
+
+  if (successfulLogRequests === 0) {
+    throw new HttpError(502, 'history_provider_failed', 'Transaction history is temporarily unavailable.');
+  }
+
+  return [...logsByKey.values()]
+    .sort((firstLog, secondLog) => {
+      const blockDiff = parseRpcQuantity(secondLog?.blockNumber) - parseRpcQuantity(firstLog?.blockNumber);
+      return blockDiff || parseRpcQuantity(secondLog?.logIndex) - parseRpcQuantity(firstLog?.logIndex);
+    })
+    .slice(0, HISTORY_PUBLIC_RPC_MAX_LOGS);
+}
+
+async function getPublicRpcHistoryTransfers(request) {
+  const networkId = normalizeHistoryNetworkId(request.networkId);
+  if (!HISTORY_PUBLIC_RPC_NETWORKS.has(networkId)) {
+    throw new HttpError(400, 'invalid_history_params', 'Public RPC transaction history is not supported for this network yet.');
+  }
+
+  const cacheKey = `${networkId}:${request.walletAddress.toLowerCase()}`;
+  const cached = historyPublicRpcTransferCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp <= HISTORY_PUBLIC_RPC_SUCCESS_CACHE_TTL_MS) {
+    return cached.transfers;
+  }
+
+  const logs = await getHistoryPublicRpcTransferLogs({ ...request, networkId });
+  const transfers = await Promise.all(logs.map(async (log) => {
+    const tokenAddress = String(log?.address || '').toLowerCase();
+    const metadata = await getHistoryPublicRpcTokenMetadata(networkId, tokenAddress);
+    const blockTimestamp = await getHistoryPublicRpcBlockTimestamp(networkId, log?.blockNumber);
+
+    return {
+      blockNum: log?.blockNumber,
+      uniqueId: getHistoryRpcLogKey(log),
+      hash: log?.transactionHash,
+      from: topicToHistoryAddress(log?.topics?.[1]),
+      to: topicToHistoryAddress(log?.topics?.[2]),
+      asset: metadata.symbol,
+      category: 'erc20',
+      rawContract: {
+        address: tokenAddress,
+        decimal: String(metadata.decimals),
+        value: log?.data || '0x0',
+      },
+      metadata: {
+        blockTimestamp,
+      },
+    };
+  }));
+
+  historyPublicRpcTransferCache.set(cacheKey, { transfers, timestamp: Date.now() });
+  return transfers;
+}
 
 function normalizeHistoryExplorerNetworkId(value) {
   const networkId = normalizeHistoryNetworkId(value);
@@ -1358,7 +1625,7 @@ function getExplorerHistoryApiUrl(action, walletAddress, networkId) {
   url.searchParams.set('action', action);
   url.searchParams.set('address', walletAddress);
   url.searchParams.set('startblock', '0');
-  url.searchParams.set('endblock', '99999999');
+  url.searchParams.set('endblock', networkId === 'bnb-chain' ? '999999999' : '99999999');
   url.searchParams.set('page', '1');
   url.searchParams.set('offset', HISTORY_EXPLORER_PAGE_SIZE);
   url.searchParams.set('sort', 'desc');
@@ -1405,12 +1672,15 @@ async function requestExplorerHistoryList(action, walletAddress, networkId) {
 
 async function getExplorerHistoryTransactions(request) {
   const networkId = normalizeHistoryExplorerNetworkId(request.networkId);
-  const [tokenTransfers, nativeTransactions] = await Promise.all([
+  const [tokenTransferResult, nativeTransactionResult] = await Promise.allSettled([
     requestExplorerHistoryList('tokentx', request.walletAddress, networkId),
     requestExplorerHistoryList('txlist', request.walletAddress, networkId),
   ]);
 
-  return { tokenTransfers, nativeTransactions };
+  return {
+    tokenTransfers: tokenTransferResult.status === 'fulfilled' ? tokenTransferResult.value : [],
+    nativeTransactions: nativeTransactionResult.status === 'fulfilled' ? nativeTransactionResult.value : [],
+  };
 }
 
 function getHistoryRouteSegments(url) {
@@ -1452,13 +1722,46 @@ async function handleHistoryProxy(req, res, url) {
     return;
   }
 
+  if (req.method === 'GET' && segments.length === 1 && segments[0] === 'rpc-token-transfers') {
+    const request = {
+      walletAddress: requireHistoryWalletAddress(url.searchParams.get('walletAddress')),
+      networkId: normalizeHistoryNetworkId(url.searchParams.get('networkId')),
+    };
+    const transfers = await getPublicRpcHistoryTransfers(request);
+    sendJson(req, res, 200, { data: { transfers, provider: 'public-rpc', refreshedAt: Date.now() } });
+    return;
+  }
   if (req.method === 'GET' && segments.length === 1 && segments[0] === 'explorer-transactions') {
     const request = {
       walletAddress: requireHistoryWalletAddress(url.searchParams.get('walletAddress')),
-      networkId: normalizeHistoryExplorerNetworkId(url.searchParams.get('networkId')),
+      networkId: normalizeHistoryNetworkId(url.searchParams.get('networkId')),
     };
-    const explorerTransactions = await getExplorerHistoryTransactions(request);
-    sendJson(req, res, 200, { data: { ...explorerTransactions, provider: 'bscscan', refreshedAt: Date.now() } });
+
+    if (!HISTORY_EXPLORER_NETWORKS.has(request.networkId)) {
+      sendJson(req, res, 200, {
+        data: {
+          tokenTransfers: [],
+          nativeTransactions: [],
+          provider: 'disabled',
+          refreshedAt: Date.now(),
+        },
+      });
+      return;
+    }
+
+    try {
+      const explorerTransactions = await getExplorerHistoryTransactions(request);
+      sendJson(req, res, 200, { data: { ...explorerTransactions, provider: request.networkId === 'bnb-chain' ? 'bscscan' : 'etherscan', refreshedAt: Date.now() } });
+    } catch (error) {
+      sendJson(req, res, 200, {
+        data: {
+          tokenTransfers: [],
+          nativeTransactions: [],
+          provider: 'unavailable',
+          refreshedAt: Date.now(),
+        },
+      });
+    }
     return;
   }
 

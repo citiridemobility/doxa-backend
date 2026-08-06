@@ -94,7 +94,44 @@ const SUPABASE_URL = env('SUPABASE_URL');
 const SUPABASE_SERVICE_ROLE_KEY = env('SUPABASE_SERVICE_ROLE_KEY');
 const DOXA_NOTIFICATIONS_CRON_SECRET = env('DOXA_NOTIFICATIONS_CRON_SECRET');
 const DISPATCH_ENDPOINT = env('DOXA_NOTIFICATIONS_DISPATCH_ENDPOINT', false) || env('EXPO_PUBLIC_DOXA_NOTIFICATIONS_ENDPOINT', false) || 'http://localhost:8787/notifications';
-const COINGECKO_API_KEY = process.env.COINGECKO_API_KEY || process.env.COINGECKO_PRO_API_KEY || '';
+const COINGECKO_API_KEY = process.env.COINGECKO_API_KEY || process.env.COINGECKO_DEMO_API_KEY || process.env.COINGECKO_PRO_API_KEY || '';
+
+const deriveSiblingEndpoint = (endpoint, fromRoute, toRoute) => {
+  const cleanedEndpoint = String(endpoint || '').trim().replace(/\/+$/, '');
+  if (!cleanedEndpoint) return '';
+  return cleanedEndpoint.replace(new RegExp(`/${fromRoute}$`, 'i'), `/${toRoute}`);
+};
+
+const MARKET_ENDPOINT = env('DOXA_MARKET_ENDPOINT', false) || deriveSiblingEndpoint(DISPATCH_ENDPOINT, 'notifications', 'market');
+
+const fetchDoxaMarketProxy = async (route, params) => {
+  if (!MARKET_ENDPOINT) return null;
+
+  try {
+    const url = new URL(`${MARKET_ENDPOINT.replace(/\/+$/, '')}/${route}`);
+    Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, String(value)));
+
+    const response = await fetch(url, { headers: { Accept: 'application/json' } });
+    if (!response.ok) return null;
+
+    return getJson(response);
+  } catch (error) {
+    console.warn(`Doxa market proxy ${route} failed:`, error instanceof Error ? error.message : error);
+    return null;
+  }
+};
+
+const normalizeMarketProxyPriceMap = (marketData) => {
+  if (!marketData || typeof marketData !== 'object' || Array.isArray(marketData)) return null;
+
+  return Object.entries(marketData).reduce((prices, [key, value]) => {
+    const price = parseNumeric(value?.price ?? value?.usd);
+    if (Number.isFinite(price) && price > 0) {
+      prices[key.toLowerCase()] = { usd: price };
+    }
+    return prices;
+  }, {});
+};
 
 const getJson = async (response) => {
   const text = await response.text();
@@ -178,13 +215,23 @@ const buildPriceBatches = (tokens) => {
 };
 
 const fetchContractPrices = async (platformId, contractAddresses) => {
+  const proxiedPayload = await fetchDoxaMarketProxy('token-prices', {
+    platformId,
+    contractAddresses: contractAddresses.join(','),
+    currency: 'usd',
+  });
+  const proxiedPrices = normalizeMarketProxyPriceMap(proxiedPayload?.data?.marketData);
+  if (proxiedPrices && Object.keys(proxiedPrices).length) {
+    return proxiedPrices;
+  }
+
   const url = new URL(`${COINGECKO_API_BASE_URL}/simple/token_price/${platformId}`);
   url.searchParams.set('contract_addresses', contractAddresses.join(','));
   url.searchParams.set('vs_currencies', 'usd');
 
   const headers = { Accept: 'application/json' };
   if (COINGECKO_API_KEY) {
-    headers['x-cg-demo-api-key'] = COINGECKE_API_KEY;
+    headers['x-cg-demo-api-key'] = COINGECKO_API_KEY;
     headers['x-cg-pro-api-key'] = COINGECKO_API_KEY;
   }
 
@@ -197,6 +244,15 @@ const fetchContractPrices = async (platformId, contractAddresses) => {
 };
 
 const fetchCoinPrices = async (coinIds) => {
+  const proxiedPayload = await fetchDoxaMarketProxy('coin-prices', {
+    ids: coinIds.join(','),
+    currency: 'usd',
+  });
+  const proxiedPrices = normalizeMarketProxyPriceMap(proxiedPayload?.data?.marketData);
+  if (proxiedPrices && Object.keys(proxiedPrices).length) {
+    return proxiedPrices;
+  }
+
   const url = new URL(`${COINGECKO_API_BASE_URL}/simple/price`);
   url.searchParams.set('ids', coinIds.join(','));
   url.searchParams.set('vs_currencies', 'usd');
@@ -204,7 +260,7 @@ const fetchCoinPrices = async (coinIds) => {
   const headers = { Accept: 'application/json' };
   if (COINGECKO_API_KEY) {
     headers['x-cg-demo-api-key'] = COINGECKO_API_KEY;
-    headers['x-cg-pro-api-key'] = COINGECKE_API_KEY;
+    headers['x-cg-pro-api-key'] = COINGECKO_API_KEY;
   }
 
   const response = await fetch(url, { headers });
@@ -353,6 +409,15 @@ const calculateMessages = (device, prices) => {
   return messages;
 };
 
+const completeClaimedDispatches = async (claimedIds) => {
+  for (const id of claimedIds) {
+    try {
+      await fetchSupabase('rpc/complete_doxa_price_alerts_dispatch', { method: 'POST', body: { dispatch_id: id } });
+    } catch (err) {
+      console.error('Failed to mark dispatch id complete:', id, err instanceof Error ? err.message : err);
+    }
+  }
+};
 const run = async () => {
   console.log('Starting Doxa price alert runner...');
 
@@ -374,20 +439,21 @@ const run = async () => {
   }
 
   if (claimedIds.length === 0) {
-    console.log('No scheduled dispatch items found.');
-    return;
+    console.log('No scheduled dispatch items found; running direct price alert scan.');
   }
 
   // Run the existing device -> message flow and dispatch payloads.
   const devices = await fetchDevices();
   if (!Array.isArray(devices) || devices.length === 0) {
     console.log('No active notification devices found.');
+    await completeClaimedDispatches(claimedIds);
     return;
   }
 
   const allTokens = devices.flatMap((device) => Array.isArray(device.tokens) ? device.tokens : []);
   if (!allTokens.length) {
     console.log('No tokens registered for price alerts.');
+    await completeClaimedDispatches(claimedIds);
     return;
   }
 
@@ -404,6 +470,7 @@ const run = async () => {
 
   if (!allMessages.length) {
     console.log('No price alert messages to dispatch.');
+    await completeClaimedDispatches(claimedIds);
     return;
   }
 

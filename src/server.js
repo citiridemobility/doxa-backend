@@ -116,17 +116,50 @@ const HISTORY_BSCSCAN_API_URL = 'https://api.bscscan.com/api';
 const HISTORY_ETHERSCAN_V2_API_URL = 'https://api.etherscan.io/v2/api';
 const HISTORY_ETHERSCAN_V2_CHAIN_ID_BY_NETWORK = {
   ethereum: 1,
+  base: 8453,
+  arbitrum: 42161,
 };
-const HISTORY_EXPLORER_NETWORKS = new Set(['bnb-chain', 'ethereum']);
+const HISTORY_EXPLORER_NETWORKS = new Set(['bnb-chain', 'ethereum', 'base', 'arbitrum']);
 const HISTORY_EXPLORER_PAGE_SIZE = '100';
-const HISTORY_PUBLIC_RPC_NETWORKS = new Set(['bnb-chain', 'base']);
+const HISTORY_PUBLIC_RPC_NETWORKS = new Set(['bnb-chain', 'base', 'arbitrum']);
 const HISTORY_PUBLIC_RPC_DEFAULT_URLS_BY_NETWORK = {
-  'bnb-chain': ['https://bsc-dataseed.binance.org', 'https://bsc-rpc.publicnode.com', 'https://binance.llamarpc.com'],
-  base: ['https://mainnet.base.org', 'https://base-rpc.publicnode.com', 'https://base.llamarpc.com'],
+  'bnb-chain': [
+    'https://bsc-dataseed.binance.org',
+    'https://bsc-dataseed1.binance.org',
+    'https://bsc-dataseed2.binance.org',
+    'https://bsc-dataseed3.binance.org',
+    'https://bsc-dataseed4.binance.org',
+    'https://bsc-dataseed1.defibit.io',
+    'https://bsc-dataseed2.defibit.io',
+    'https://bsc-rpc.publicnode.com',
+    'https://rpc.ankr.com/bsc',
+    'https://1rpc.io/bnb',
+    'https://bsc.drpc.org',
+    'https://binance.llamarpc.com',
+  ],
+  base: [
+    'https://mainnet.base.org',
+    'https://base-rpc.publicnode.com',
+    'https://base.llamarpc.com',
+    'https://rpc.ankr.com/base',
+    'https://1rpc.io/base',
+    'https://base.drpc.org',
+    'https://base-mainnet.public.blastapi.io',
+  ],
+  arbitrum: [
+    'https://arb1.arbitrum.io/rpc',
+    'https://arbitrum-one-rpc.publicnode.com',
+    'https://arbitrum.llamarpc.com',
+    'https://rpc.ankr.com/arbitrum',
+    'https://1rpc.io/arb',
+    'https://arbitrum.drpc.org',
+    'https://arbitrum-one.public.blastapi.io',
+  ],
 };
 const HISTORY_PUBLIC_RPC_DEFAULT_LOOKBACK_BLOCKS_BY_NETWORK = {
   'bnb-chain': 80000,
   base: 120000,
+  arbitrum: 300000,
 };
 const HISTORY_PUBLIC_RPC_BLOCK_CHUNK_SIZE = 5000;
 const HISTORY_PUBLIC_RPC_MAX_LOGS = 150;
@@ -1332,21 +1365,36 @@ const historyPublicRpcBlockCache = new Map();
 let historyPublicRpcRequestId = 1;
 
 function getConfiguredHistoryPublicRpcUrls(networkId) {
-  const envValue = networkId === 'bnb-chain'
-    ? cleanEnvValue(process.env.HISTORY_RPC_BNB_CHAIN_URLS || process.env.BSC_RPC_URLS || process.env.BSC_RPC_URL, 'HISTORY_RPC_BNB_CHAIN_URLS')
-    : cleanEnvValue(process.env.HISTORY_RPC_BASE_URLS || process.env.BASE_RPC_URLS || process.env.BASE_RPC_URL, 'HISTORY_RPC_BASE_URLS');
+  const envKeysByNetwork = {
+    'bnb-chain': ['HISTORY_RPC_BNB_CHAIN_URLS', 'BSC_RPC_URLS', 'BSC_RPC_URL'],
+    base: ['HISTORY_RPC_BASE_URLS', 'BASE_RPC_URLS', 'BASE_RPC_URL'],
+    arbitrum: ['HISTORY_RPC_ARBITRUM_URLS', 'ARBITRUM_RPC_URLS', 'ARBITRUM_RPC_URL'],
+  };
+  const envKeys = envKeysByNetwork[networkId] || [];
+  const envValue = envKeys
+    .map((key) => cleanEnvValue(process.env[key], key))
+    .find((value) => Boolean(value)) || '';
   const configuredUrls = envValue
     .split(',')
     .map((url) => url.trim())
-    .filter(Boolean);
+    .filter((url) => url && !/alchemy\.com/i.test(url));
 
-  return Array.from(new Set([...configuredUrls, ...(HISTORY_PUBLIC_RPC_DEFAULT_URLS_BY_NETWORK[networkId] || [])]));
+  return Array.from(
+    new Set(
+      [...configuredUrls, ...(HISTORY_PUBLIC_RPC_DEFAULT_URLS_BY_NETWORK[networkId] || [])].filter(
+        (url) => !/alchemy\.com/i.test(url),
+      ),
+    ),
+  );
 }
 
 function getHistoryPublicRpcLookbackBlocks(networkId) {
-  const rawValue = networkId === 'bnb-chain'
-    ? process.env.HISTORY_RPC_BNB_CHAIN_LOOKBACK_BLOCKS
-    : process.env.HISTORY_RPC_BASE_LOOKBACK_BLOCKS;
+  const envKeyByNetwork = {
+    'bnb-chain': 'HISTORY_RPC_BNB_CHAIN_LOOKBACK_BLOCKS',
+    base: 'HISTORY_RPC_BASE_LOOKBACK_BLOCKS',
+    arbitrum: 'HISTORY_RPC_ARBITRUM_LOOKBACK_BLOCKS',
+  };
+  const rawValue = process.env[envKeyByNetwork[networkId] || ''] || process.env.HISTORY_RPC_LOOKBACK_BLOCKS;
   const parsedValue = Number(cleanEnvValue(rawValue, 'HISTORY_RPC_LOOKBACK_BLOCKS'));
 
   return Number.isFinite(parsedValue) && parsedValue > 0

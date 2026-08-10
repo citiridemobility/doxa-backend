@@ -157,15 +157,18 @@ const HISTORY_PUBLIC_RPC_DEFAULT_URLS_BY_NETWORK = {
   ],
 };
 const HISTORY_PUBLIC_RPC_DEFAULT_LOOKBACK_BLOCKS_BY_NETWORK = {
-  'bnb-chain': 80000,
-  base: 120000,
-  arbitrum: 300000,
+  'bnb-chain': 20000,
+  base: 40000,
+  arbitrum: 80000,
 };
-const HISTORY_PUBLIC_RPC_BLOCK_CHUNK_SIZE = 5000;
-const HISTORY_PUBLIC_RPC_MAX_LOGS = 150;
+const HISTORY_PUBLIC_RPC_BLOCK_CHUNK_SIZE = 2000;
+const HISTORY_PUBLIC_RPC_MAX_LOGS = 100;
 const HISTORY_PUBLIC_RPC_SUCCESS_CACHE_TTL_MS = 60 * 1000;
 const HISTORY_PUBLIC_RPC_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const HISTORY_PUBLIC_RPC_ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+const HISTORY_PUBLIC_RPC_TIMEOUT_MS = 8000;
+const HISTORY_PUBLIC_RPC_MAX_URL_ATTEMPTS = 3;
+const HISTORY_PUBLIC_RPC_SCAN_BUDGET_MS = 15000;
 const MARKET_COIN_ID_BY_SYMBOL = {
   AVAX: 'avalanche-2',
   BNB: 'binancecoin',
@@ -1428,10 +1431,13 @@ function getHistoryRpcLogKey(log) {
 }
 
 async function requestHistoryPublicRpc(networkId, method, params) {
-  const urls = getConfiguredHistoryPublicRpcUrls(networkId);
+  const urls = getConfiguredHistoryPublicRpcUrls(networkId).slice(0, HISTORY_PUBLIC_RPC_MAX_URL_ATTEMPTS);
   let firstError;
 
   for (const url of urls) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), HISTORY_PUBLIC_RPC_TIMEOUT_MS);
+
     try {
       const response = await fetch(url, {
         method: 'POST',
@@ -1442,6 +1448,7 @@ async function requestHistoryPublicRpc(networkId, method, params) {
           method,
           params,
         }),
+        signal: controller.signal,
       });
       const payload = await readResponseJson(response);
 
@@ -1452,6 +1459,8 @@ async function requestHistoryPublicRpc(networkId, method, params) {
       return payload?.result;
     } catch (error) {
       firstError = firstError || error;
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
@@ -1544,8 +1553,13 @@ async function getHistoryPublicRpcTransferLogs(request) {
   const walletTopic = padHistoryAddressTopic(request.walletAddress);
   const logsByKey = new Map();
   let successfulLogRequests = 0;
+  const scanStartedAt = Date.now();
 
   for (let chunkEnd = latestBlock; chunkEnd >= fromBlock; chunkEnd -= HISTORY_PUBLIC_RPC_BLOCK_CHUNK_SIZE) {
+    if (Date.now() - scanStartedAt > HISTORY_PUBLIC_RPC_SCAN_BUDGET_MS) {
+      break;
+    }
+
     const chunkStart = Math.max(fromBlock, chunkEnd - HISTORY_PUBLIC_RPC_BLOCK_CHUNK_SIZE + 1);
     const fromBlockHex = toRpcQuantity(chunkStart);
     const toBlockHex = toRpcQuantity(chunkEnd);
@@ -1554,30 +1568,35 @@ async function getHistoryPublicRpcTransferLogs(request) {
       { fromBlock: fromBlockHex, toBlock: toBlockHex, topics: [HISTORY_PUBLIC_RPC_TRANSFER_TOPIC, null, walletTopic] },
     ];
 
-    for (const filter of filters) {
-      try {
-        const logs = await requestHistoryPublicRpc(request.networkId, 'eth_getLogs', [filter]);
+    const chunkResults = await Promise.allSettled(
+      filters.map((filter) => requestHistoryPublicRpc(request.networkId, 'eth_getLogs', [filter])),
+    );
+
+    chunkResults.forEach((result, index) => {
+      if (result.status === 'fulfilled') {
         successfulLogRequests += 1;
-        (Array.isArray(logs) ? logs : []).forEach((log) => {
+        (Array.isArray(result.value) ? result.value : []).forEach((log) => {
           const key = getHistoryRpcLogKey(log);
           if (key && !logsByKey.has(key)) logsByKey.set(key, log);
         });
-      } catch (error) {
-        console.warn('Public RPC log chunk failed', {
-          networkId: request.networkId,
-          fromBlock: fromBlockHex,
-          toBlock: toBlockHex,
-          message: error instanceof Error ? error.message : String(error),
-        });
+        return;
       }
-    }
+
+      console.warn('Public RPC log chunk failed', {
+        networkId: request.networkId,
+        fromBlock: fromBlockHex,
+        toBlock: toBlockHex,
+        filterIndex: index,
+        message: result.reason instanceof Error ? result.reason.message : String(result.reason),
+      });
+    });
 
     if (logsByKey.size >= HISTORY_PUBLIC_RPC_MAX_LOGS) {
       break;
     }
   }
 
-  if (successfulLogRequests === 0) {
+  if (successfulLogRequests === 0 && logsByKey.size === 0) {
     throw new HttpError(502, 'history_provider_failed', 'Transaction history is temporarily unavailable.');
   }
 
@@ -1602,12 +1621,31 @@ async function getPublicRpcHistoryTransfers(request) {
   }
 
   const logs = await getHistoryPublicRpcTransferLogs({ ...request, networkId });
-  const transfers = await Promise.all(logs.map(async (log) => {
-    const tokenAddress = String(log?.address || '').toLowerCase();
-    const metadata = await getHistoryPublicRpcTokenMetadata(networkId, tokenAddress);
-    const blockTimestamp = await getHistoryPublicRpcBlockTimestamp(networkId, log?.blockNumber);
+  const enrichmentStartedAt = Date.now();
+  const transfers = [];
 
-    return {
+  for (const log of logs) {
+    if (Date.now() - enrichmentStartedAt > HISTORY_PUBLIC_RPC_SCAN_BUDGET_MS) {
+      break;
+    }
+
+    const tokenAddress = String(log?.address || '').toLowerCase();
+    let metadata = { symbol: 'TOKEN', decimals: 18 };
+    let blockTimestamp = new Date().toISOString();
+
+    try {
+      metadata = await getHistoryPublicRpcTokenMetadata(networkId, tokenAddress);
+    } catch {
+      // Keep placeholder metadata so history still returns.
+    }
+
+    try {
+      blockTimestamp = await getHistoryPublicRpcBlockTimestamp(networkId, log?.blockNumber);
+    } catch {
+      // Keep current timestamp fallback.
+    }
+
+    transfers.push({
       blockNum: log?.blockNumber,
       uniqueId: getHistoryRpcLogKey(log),
       hash: log?.transactionHash,
@@ -1623,8 +1661,8 @@ async function getPublicRpcHistoryTransfers(request) {
       metadata: {
         blockTimestamp,
       },
-    };
-  }));
+    });
+  }
 
   historyPublicRpcTransferCache.set(cacheKey, { transfers, timestamp: Date.now() });
   return transfers;

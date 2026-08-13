@@ -111,6 +111,12 @@ select distinct on (source)
 from public.doxa_app_downloads
 order by source, recorded_at desc;
 
+-- Views are not secured with table-style RLS policies; lock them down with grants
+-- (same pattern as doxa_daily_wallet_creations / doxa_daily_transaction_volume).
+revoke all on public.doxa_daily_transaction_volume from anon, authenticated;
+revoke all on public.doxa_transaction_status_summary from anon, authenticated;
+revoke all on public.doxa_latest_downloads_by_source from anon, authenticated;
+
 grant select on public.doxa_daily_transaction_volume to service_role;
 grant select on public.doxa_transaction_status_summary to service_role;
 grant select on public.doxa_latest_downloads_by_source to service_role;

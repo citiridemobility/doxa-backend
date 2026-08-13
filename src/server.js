@@ -3722,14 +3722,59 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
   const txByDay = Object.fromEntries(dayKeys.map((day) => [day, 0]));
   const volumeByDay = Object.fromEntries(dayKeys.map((day) => [day, 0]));
   const feesByDay = Object.fromEntries(dayKeys.map((day) => [day, 0]));
+  const emptyDayMap = () => Object.fromEntries(dayKeys.map((day) => [day, 0]));
+
+  const categoryDayCounts = {
+    swap: emptyDayMap(),
+    bridge: emptyDayMap(),
+    'xchange-buy': emptyDayMap(),
+    'xchange-sell': emptyDayMap(),
+    bills: emptyDayMap(),
+  };
+  const categoryDayVolume = {
+    swap: emptyDayMap(),
+    bridge: emptyDayMap(),
+    'xchange-buy': emptyDayMap(),
+    'xchange-sell': emptyDayMap(),
+    bills: emptyDayMap(),
+  };
+  const categoryTotals = {
+    swap: { count: 0, volumeUsd: 0, feeUsd: 0 },
+    bridge: { count: 0, volumeUsd: 0, feeUsd: 0 },
+    'xchange-buy': { count: 0, volumeUsd: 0, feeUsd: 0 },
+    'xchange-sell': { count: 0, volumeUsd: 0, feeUsd: 0 },
+    bills: { count: 0, volumeUsd: 0, feeUsd: 0 },
+  };
+
   const categoryCounts = {};
   const statusCounts = {};
   const networkCounts = {};
   const sourceCounts = {};
+  const xchangeModeCounts = { buy: 0, sell: 0, unknown: 0 };
 
   let volumeUsd = 0;
   let feeUsd = 0;
   let completedCount = 0;
+
+  const resolveXchangeMode = (tx) => {
+    const metadata = tx.metadata && typeof tx.metadata === 'object' ? tx.metadata : {};
+    const mode = String(metadata.mode || metadata.xchangeMode || '').toLowerCase();
+    if (mode === 'buy' || mode === 'sell') return mode;
+    if (tx.direction === 'received') return 'buy';
+    if (tx.direction === 'sent') return 'sell';
+    return 'unknown';
+  };
+
+  const resolveTrackedCategory = (tx) => {
+    const category = tx.category || 'transaction';
+    if (category === 'swap' || category === 'bridge' || category === 'bills') return category;
+    if (category === 'xchange') {
+      const mode = resolveXchangeMode(tx);
+      if (mode === 'buy') return 'xchange-buy';
+      if (mode === 'sell') return 'xchange-sell';
+    }
+    return null;
+  };
 
   for (const wallet of wallets) {
     const day = toDayKey(wallet.created_at || wallet.client_created_at);
@@ -3756,6 +3801,20 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
     if (status === 'completed') completedCount += 1;
     const network = tx.network_label || tx.network_id || 'Unknown';
     networkCounts[network] = (networkCounts[network] || 0) + 1;
+
+    if (category === 'xchange') {
+      const mode = resolveXchangeMode(tx);
+      xchangeModeCounts[mode] = (xchangeModeCounts[mode] || 0) + 1;
+    }
+
+    const tracked = resolveTrackedCategory(tx);
+    if (tracked && day in categoryDayCounts[tracked]) {
+      categoryDayCounts[tracked][day] += 1;
+      categoryDayVolume[tracked][day] += amountUsd;
+      categoryTotals[tracked].count += 1;
+      categoryTotals[tracked].volumeUsd += amountUsd;
+      categoryTotals[tracked].feeUsd += platformFeeUsd;
+    }
   }
 
   const latestDownloads = {};
@@ -3774,8 +3833,47 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
 
   const toSeries = (map) => dayKeys.map((day) => ({ day, value: map[day] || 0 }));
   const toPie = (map) => Object.entries(map)
+    .filter(([, value]) => Number(value) > 0)
     .map(([name, value]) => ({ name, value }))
     .sort((a, b) => b.value - a.value);
+
+  const activityBreakdown = dayKeys.map((day) => ({
+    day,
+    swap: categoryDayCounts.swap[day] || 0,
+    bridge: categoryDayCounts.bridge[day] || 0,
+    xchangeBuy: categoryDayCounts['xchange-buy'][day] || 0,
+    xchangeSell: categoryDayCounts['xchange-sell'][day] || 0,
+    bills: categoryDayCounts.bills[day] || 0,
+  }));
+
+  const recentTransactions = transactions
+    .slice()
+    .sort((a, b) => new Date(b.occurred_at) - new Date(a.occurred_at))
+    .slice(0, 40)
+    .map((tx) => {
+      const tracked = resolveTrackedCategory(tx);
+      const xchangeMode = tx.category === 'xchange' ? resolveXchangeMode(tx) : null;
+      return {
+        eventId: tx.event_id,
+        occurredAt: tx.occurred_at,
+        category: tx.category || 'transaction',
+        trackedCategory: tracked,
+        xchangeMode: xchangeMode === 'unknown' ? null : xchangeMode,
+        status: tx.status || 'completed',
+        direction: tx.direction || null,
+        networkId: tx.network_id || null,
+        networkLabel: tx.network_label || tx.network_id || 'Unknown',
+        tokenSymbol: tx.token_symbol || null,
+        amountText: tx.amount_text || null,
+        amountUsd: Number(tx.amount_usd) || 0,
+        platformFeeUsd: Number(tx.platform_fee_usd) || 0,
+        walletAddress: tx.wallet_address || null,
+        txHash: tx.tx_hash || null,
+        explorerUrl: tx.explorer_url || null,
+        provider: tx.provider || null,
+        reference: tx.reference || null,
+      };
+    });
 
   return {
     rangeDays: days,
@@ -3787,19 +3885,37 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
       volumeUsd,
       feeUsd,
       uptodownDownloads: latestDownloads.uptodown?.downloadCount || 0,
+      swap: categoryTotals.swap,
+      bridge: categoryTotals.bridge,
+      xchangeBuy: categoryTotals['xchange-buy'],
+      xchangeSell: categoryTotals['xchange-sell'],
+      bills: categoryTotals.bills,
     },
     series: {
       walletsByDay: toSeries(walletsByDay),
       transactionsByDay: toSeries(txByDay),
       volumeUsdByDay: toSeries(volumeByDay),
       feeUsdByDay: toSeries(feesByDay),
+      swapByDay: toSeries(categoryDayCounts.swap),
+      bridgeByDay: toSeries(categoryDayCounts.bridge),
+      xchangeBuyByDay: toSeries(categoryDayCounts['xchange-buy']),
+      xchangeSellByDay: toSeries(categoryDayCounts['xchange-sell']),
+      billsByDay: toSeries(categoryDayCounts.bills),
+      swapVolumeByDay: toSeries(categoryDayVolume.swap),
+      bridgeVolumeByDay: toSeries(categoryDayVolume.bridge),
+      xchangeBuyVolumeByDay: toSeries(categoryDayVolume['xchange-buy']),
+      xchangeSellVolumeByDay: toSeries(categoryDayVolume['xchange-sell']),
+      billsVolumeByDay: toSeries(categoryDayVolume.bills),
+      activityBreakdown,
     },
     breakdowns: {
       categories: toPie(categoryCounts),
       statuses: toPie(statusCounts),
       networks: toPie(networkCounts),
       walletSources: toPie(sourceCounts),
+      xchangeModes: toPie(xchangeModeCounts),
     },
+    recentTransactions,
     downloads: {
       latestBySource: Object.values(latestDownloads),
       history: downloads
@@ -3820,7 +3936,7 @@ async function buildAnalyticsDashboardSummary(days) {
   const since = startOfUtcDay(days - 1);
   const [wallets, transactions, downloads] = await Promise.all([
     querySupabase(`doxa_wallet_creations?select=wallet_address,source,platform,app_version,created_at,client_created_at&created_at=gte.${encodeURIComponent(since)}&order=created_at.asc`),
-    querySupabase(`doxa_wallet_transactions?select=event_id,category,status,network_id,network_label,token_symbol,amount_numeric,amount_usd,platform_fee_text,platform_fee_usd,occurred_at&occurred_at=gte.${encodeURIComponent(since)}&order=occurred_at.asc`),
+    querySupabase(`doxa_wallet_transactions?select=event_id,wallet_address,tx_hash,category,status,direction,network_id,network_label,token_symbol,amount_text,amount_numeric,amount_usd,platform_fee_text,platform_fee_usd,provider,reference,explorer_url,occurred_at,metadata&occurred_at=gte.${encodeURIComponent(since)}&order=occurred_at.asc`),
     querySupabase('doxa_app_downloads?select=source,download_count,delta_count,app_url,recorded_at,metadata&order=recorded_at.desc&limit=200'),
   ]);
 

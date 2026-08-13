@@ -369,6 +369,8 @@ const config = {
   },
   sogoBillsUsdcNgnRate: cleanEnvValue(process.env.SOGO_BILLS_USDC_NGN_RATE || process.env.SOGO_BILLS_STABLE_NGN_RATE, 'SOGO_BILLS_USDC_NGN_RATE'),
   sogoBillsUsdtNgnRate: cleanEnvValue(process.env.SOGO_BILLS_USDT_NGN_RATE || process.env.SOGO_BILLS_STABLE_NGN_RATE || process.env.SOGO_BILLS_USDC_NGN_RATE, 'SOGO_BILLS_USDT_NGN_RATE'),
+  analyticsDashboardSecret: cleanEnvValue(process.env.DOXA_ANALYTICS_DASHBOARD_SECRET, 'DOXA_ANALYTICS_DASHBOARD_SECRET'),
+  uptodownAppUrl: cleanEnvValue(process.env.DOXA_UPTODOWN_APP_URL, 'DOXA_UPTODOWN_APP_URL'),
 };
 
 function getAllowedOrigin(req) {
@@ -3167,8 +3169,10 @@ async function recordSogoBillAnalytics({ body, payment, paymentStatus, billRecor
       tokenSymbol: payment.asset,
       tokenAddress: payment.tokenAddress,
       amount: `${payment.amount} ${payment.asset}`,
+      amountUsd: Number(payment.amount),
       fiatAmount: `NGN ${body.amount}`,
       platformFee: `${payment.platformFeeAmount} ${payment.asset}`,
+      platformFeeUsd: Number(payment.platformFeeAmount),
       provider,
       counterparty: provider,
       reference,
@@ -3531,6 +3535,29 @@ function sanitizeAnalyticsAmount(value) {
   };
 }
 
+function sanitizeAnalyticsUsdAmount(value) {
+  if (value === undefined || value === null || value === '') return undefined;
+  const numeric = typeof value === 'number' ? value : Number(String(value).replace(/,/g, '').replace(/[^0-9.\-]/g, ''));
+  if (!Number.isFinite(numeric)) return undefined;
+  return Math.round(numeric * 1e8) / 1e8;
+}
+
+const ANALYTICS_STABLE_SYMBOLS = new Set(['USDC', 'USDT', 'DAI', 'BUSD', 'USD']);
+
+function inferStableUsdAmount(amountText, tokenSymbol, explicitUsd) {
+  const explicit = sanitizeAnalyticsUsdAmount(explicitUsd);
+  if (explicit !== undefined) return explicit;
+
+  const parsed = sanitizeAnalyticsAmount(amountText);
+  if (parsed.amountNumeric === undefined) return undefined;
+
+  const symbol = sanitizeAnalyticsString(tokenSymbol, 32)?.toUpperCase();
+  const mentionsStable = ANALYTICS_STABLE_SYMBOLS.has(symbol || '')
+    || ANALYTICS_STABLE_SYMBOLS.has((parsed.amountText || '').toUpperCase().match(/\b(USDC|USDT|DAI|BUSD|USD)\b/)?.[1] || '');
+
+  return mentionsStable ? parsed.amountNumeric : undefined;
+}
+
 function sanitizeAnalyticsMetadata(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   return JSON.parse(JSON.stringify(value));
@@ -3562,6 +3589,18 @@ function sanitizeTransactionAnalyticsBody(body) {
   const category = sanitizeAnalyticsEnum(body.category, ANALYTICS_TRANSACTION_CATEGORIES, 'transaction');
   const eventId = sanitizeAnalyticsString(body.eventId || body.event_id, 220) || `${walletAddress}:${category}:${txHash || randomUUID()}`;
   const amount = sanitizeAnalyticsAmount(body.amount || body.amountText || body.amount_text);
+  const tokenSymbol = sanitizeAnalyticsString(body.tokenSymbol || body.token_symbol, 32)?.toUpperCase();
+  const platformFeeText = sanitizeAnalyticsString(body.platformFee || body.platformFeeText || body.platform_fee_text, 80);
+  const amountUsd = inferStableUsdAmount(
+    amount.amountText,
+    tokenSymbol,
+    body.amountUsd ?? body.amount_usd,
+  );
+  const platformFeeUsd = inferStableUsdAmount(
+    platformFeeText,
+    tokenSymbol,
+    body.platformFeeUsd ?? body.platform_fee_usd ?? body.feeUsd ?? body.fee_usd,
+  );
 
   return {
     event_id: eventId,
@@ -3572,12 +3611,14 @@ function sanitizeTransactionAnalyticsBody(body) {
     direction: sanitizeAnalyticsEnum(body.direction, ANALYTICS_TRANSACTION_DIRECTIONS, undefined),
     network_id: sanitizeAnalyticsString(body.networkId || body.network_id, 80),
     network_label: sanitizeAnalyticsString(body.networkLabel || body.network_label, 120),
-    token_symbol: sanitizeAnalyticsString(body.tokenSymbol || body.token_symbol, 32)?.toUpperCase(),
+    token_symbol: tokenSymbol,
     token_address: sanitizeAnalyticsAddress(body.tokenAddress || body.token_address, 'tokenAddress', false),
     amount_text: amount.amountText,
     amount_numeric: amount.amountNumeric,
+    amount_usd: amountUsd,
     fiat_amount_text: sanitizeAnalyticsString(body.fiatAmount || body.fiatAmountText || body.fiat_amount_text, 80),
-    platform_fee_text: sanitizeAnalyticsString(body.platformFee || body.platformFeeText || body.platform_fee_text, 80),
+    platform_fee_text: platformFeeText,
+    platform_fee_usd: platformFeeUsd,
     provider: sanitizeAnalyticsString(body.provider, 120),
     counterparty: sanitizeAnalyticsString(body.counterparty, 180),
     reference: sanitizeAnalyticsString(body.reference, 180),
@@ -3616,6 +3657,238 @@ async function upsertSupabaseRecord(tableName, record, onConflict) {
   return payload;
 }
 
+async function querySupabase(pathWithQuery) {
+  assertAnalyticsConfigured();
+  const url = `${config.supabaseUrl}/rest/v1/${pathWithQuery}`;
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      apikey: config.supabaseServiceRoleKey,
+      Authorization: `Bearer ${config.supabaseServiceRoleKey}`,
+      Accept: 'application/json',
+    },
+  });
+  const payload = await readResponseJson(response);
+
+  if (!response.ok) {
+    console.error('Supabase analytics query failed', {
+      pathWithQuery,
+      status: response.status,
+      message: payload?.message || payload?.error || payload,
+    });
+    throw new HttpError(502, 'analytics_read_failed', 'Unable to load analytics right now.');
+  }
+
+  return payload;
+}
+
+function assertAnalyticsDashboardAccess(req) {
+  if (!config.analyticsDashboardSecret) {
+    throw new HttpError(500, 'analytics_dashboard_not_configured', 'Set DOXA_ANALYTICS_DASHBOARD_SECRET on the backend.');
+  }
+
+  const headerValue = String(req.headers['x-doxa-analytics-secret'] || req.headers['authorization']?.replace(/^Bearer\s+/i, '') || '');
+  const expected = Buffer.from(config.analyticsDashboardSecret);
+  const actual = Buffer.from(headerValue);
+
+  if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
+    throw new HttpError(401, 'unauthorized', 'Invalid analytics dashboard credentials.');
+  }
+}
+
+function parseAnalyticsDays(value, fallback = 30) {
+  const days = Number(value);
+  if (!Number.isFinite(days)) return fallback;
+  return Math.min(Math.max(Math.trunc(days), 1), 365);
+}
+
+function startOfUtcDay(daysAgo) {
+  const date = new Date();
+  date.setUTCHours(0, 0, 0, 0);
+  date.setUTCDate(date.getUTCDate() - daysAgo);
+  return date.toISOString();
+}
+
+function toDayKey(value) {
+  return String(value || '').slice(0, 10);
+}
+
+function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
+  const dayKeys = Array.from({ length: days }, (_, index) => toDayKey(startOfUtcDay(days - 1 - index)));
+  const walletsByDay = Object.fromEntries(dayKeys.map((day) => [day, 0]));
+  const txByDay = Object.fromEntries(dayKeys.map((day) => [day, 0]));
+  const volumeByDay = Object.fromEntries(dayKeys.map((day) => [day, 0]));
+  const feesByDay = Object.fromEntries(dayKeys.map((day) => [day, 0]));
+  const categoryCounts = {};
+  const statusCounts = {};
+  const networkCounts = {};
+  const sourceCounts = {};
+
+  let volumeUsd = 0;
+  let feeUsd = 0;
+  let completedCount = 0;
+
+  for (const wallet of wallets) {
+    const day = toDayKey(wallet.created_at || wallet.client_created_at);
+    if (day in walletsByDay) walletsByDay[day] += 1;
+    const source = wallet.source || 'unknown';
+    sourceCounts[source] = (sourceCounts[source] || 0) + 1;
+  }
+
+  for (const tx of transactions) {
+    const day = toDayKey(tx.occurred_at);
+    if (day in txByDay) txByDay[day] += 1;
+
+    const amountUsd = Number(tx.amount_usd) || 0;
+    const platformFeeUsd = Number(tx.platform_fee_usd) || 0;
+    volumeUsd += amountUsd;
+    feeUsd += platformFeeUsd;
+    if (day in volumeByDay) volumeByDay[day] += amountUsd;
+    if (day in feesByDay) feesByDay[day] += platformFeeUsd;
+
+    const category = tx.category || 'transaction';
+    categoryCounts[category] = (categoryCounts[category] || 0) + 1;
+    const status = tx.status || 'completed';
+    statusCounts[status] = (statusCounts[status] || 0) + 1;
+    if (status === 'completed') completedCount += 1;
+    const network = tx.network_label || tx.network_id || 'Unknown';
+    networkCounts[network] = (networkCounts[network] || 0) + 1;
+  }
+
+  const latestDownloads = {};
+  for (const row of downloads) {
+    const source = row.source || 'other';
+    if (!latestDownloads[source] || new Date(row.recorded_at) > new Date(latestDownloads[source].recordedAt)) {
+      latestDownloads[source] = {
+        source,
+        downloadCount: Number(row.download_count) || 0,
+        deltaCount: row.delta_count == null ? null : Number(row.delta_count),
+        appUrl: row.app_url || null,
+        recordedAt: row.recorded_at,
+      };
+    }
+  }
+
+  const toSeries = (map) => dayKeys.map((day) => ({ day, value: map[day] || 0 }));
+  const toPie = (map) => Object.entries(map)
+    .map(([name, value]) => ({ name, value }))
+    .sort((a, b) => b.value - a.value);
+
+  return {
+    rangeDays: days,
+    generatedAt: new Date().toISOString(),
+    totals: {
+      wallets: wallets.length,
+      transactions: transactions.length,
+      completedTransactions: completedCount,
+      volumeUsd,
+      feeUsd,
+      uptodownDownloads: latestDownloads.uptodown?.downloadCount || 0,
+    },
+    series: {
+      walletsByDay: toSeries(walletsByDay),
+      transactionsByDay: toSeries(txByDay),
+      volumeUsdByDay: toSeries(volumeByDay),
+      feeUsdByDay: toSeries(feesByDay),
+    },
+    breakdowns: {
+      categories: toPie(categoryCounts),
+      statuses: toPie(statusCounts),
+      networks: toPie(networkCounts),
+      walletSources: toPie(sourceCounts),
+    },
+    downloads: {
+      latestBySource: Object.values(latestDownloads),
+      history: downloads
+        .slice()
+        .sort((a, b) => new Date(a.recorded_at) - new Date(b.recorded_at))
+        .map((row) => ({
+          source: row.source,
+          downloadCount: Number(row.download_count) || 0,
+          deltaCount: row.delta_count == null ? null : Number(row.delta_count),
+          recordedAt: row.recorded_at,
+          appUrl: row.app_url || null,
+        })),
+    },
+  };
+}
+
+async function buildAnalyticsDashboardSummary(days) {
+  const since = startOfUtcDay(days - 1);
+  const [wallets, transactions, downloads] = await Promise.all([
+    querySupabase(`doxa_wallet_creations?select=wallet_address,source,platform,app_version,created_at,client_created_at&created_at=gte.${encodeURIComponent(since)}&order=created_at.asc`),
+    querySupabase(`doxa_wallet_transactions?select=event_id,category,status,network_id,network_label,token_symbol,amount_numeric,amount_usd,platform_fee_text,platform_fee_usd,occurred_at&occurred_at=gte.${encodeURIComponent(since)}&order=occurred_at.asc`),
+    querySupabase('doxa_app_downloads?select=source,download_count,delta_count,app_url,recorded_at,metadata&order=recorded_at.desc&limit=200'),
+  ]);
+
+  return aggregateDashboardMetrics({
+    wallets: Array.isArray(wallets) ? wallets : [],
+    transactions: Array.isArray(transactions) ? transactions : [],
+    downloads: Array.isArray(downloads) ? downloads : [],
+    days,
+  });
+}
+
+function parseUptodownDownloadCount(html) {
+  const patterns = [
+    /itemprop=["']interactionCount["'][^>]*content=["'](?:UserDownloads|Downloads):(\d+)/i,
+    /"userInteractionCount"\s*:\s*(\d+)/i,
+    /data-downloads=["'](\d+)["']/i,
+    /(\d[\d,]*)\s*(?:downloads|descargas)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (!match?.[1]) continue;
+    const count = Number(String(match[1]).replace(/,/g, ''));
+    if (Number.isFinite(count) && count >= 0) return count;
+  }
+
+  return null;
+}
+
+async function fetchUptodownDownloadCount(appUrl) {
+  const response = await fetch(appUrl, {
+    headers: {
+      Accept: 'text/html,application/xhtml+xml',
+      'User-Agent': 'DoxaWalletAnalytics/1.0',
+    },
+  });
+  const html = await response.text();
+  if (!response.ok) {
+    throw new HttpError(502, 'uptodown_fetch_failed', `Unable to fetch Uptodown page (${response.status}).`);
+  }
+
+  const downloadCount = parseUptodownDownloadCount(html);
+  if (downloadCount == null) {
+    throw new HttpError(502, 'uptodown_parse_failed', 'Could not parse download count from the Uptodown page. Record the count manually.');
+  }
+
+  return downloadCount;
+}
+
+async function recordAppDownloadSnapshot({ source, downloadCount, appUrl, metadata = {} }) {
+  const previousRows = await querySupabase(
+    `doxa_app_downloads?select=download_count,recorded_at&source=eq.${encodeURIComponent(source)}&order=recorded_at.desc&limit=1`,
+  );
+  const previousCount = Array.isArray(previousRows) && previousRows[0] ? Number(previousRows[0].download_count) : null;
+  const deltaCount = previousCount == null || !Number.isFinite(previousCount) ? null : downloadCount - previousCount;
+
+  return upsertSupabaseRecord(
+    'doxa_app_downloads',
+    {
+      id: randomUUID(),
+      source,
+      download_count: downloadCount,
+      delta_count: deltaCount,
+      app_url: appUrl || undefined,
+      recorded_at: new Date().toISOString(),
+      metadata,
+    },
+    'id',
+  );
+}
+
 async function handleAnalyticsProxy(req, res, url) {
   assertCors(req);
   const segments = getAnalyticsRouteSegments(url);
@@ -3625,31 +3898,78 @@ async function handleAnalyticsProxy(req, res, url) {
       status: 'ok',
       service: 'doxa-analytics-proxy',
       configured: Boolean(config.supabaseUrl && config.supabaseServiceRoleKey),
+      dashboardConfigured: Boolean(config.analyticsDashboardSecret),
+      uptodownConfigured: Boolean(config.uptodownAppUrl),
     });
+    return;
+  }
+
+  if (req.method === 'GET' && segments.length === 1 && segments[0] === 'dashboard') {
+    assertAnalyticsDashboardAccess(req);
+    const days = parseAnalyticsDays(url.searchParams.get('days'), 30);
+    const summary = await buildAnalyticsDashboardSummary(days);
+    sendJson(req, res, 200, { status: 'ok', data: summary });
+    return;
+  }
+
+  if (req.method === 'GET' && segments.length === 1 && segments[0] === 'downloads') {
+    assertAnalyticsDashboardAccess(req);
+    const rows = await querySupabase('doxa_app_downloads?select=*&order=recorded_at.desc&limit=100');
+    sendJson(req, res, 200, { status: 'ok', data: rows });
+    return;
+  }
+
+  if (req.method === 'POST' && segments.length === 1 && segments[0] === 'downloads') {
+    assertAnalyticsDashboardAccess(req);
+    const body = await readJson(req);
+    const source = sanitizeAnalyticsEnum(body.source, new Set(['uptodown', 'play_store', 'app_store', 'apk', 'other']), 'uptodown');
+    const downloadCountRaw = body.downloadCount ?? body.download_count ?? body.count;
+    const downloadCount = Number(String(downloadCountRaw ?? '').replace(/,/g, ''));
+    if (!Number.isInteger(downloadCount) || downloadCount < 0) {
+      throw new HttpError(400, 'invalid_analytics_payload', 'downloadCount must be a non-negative integer.');
+    }
+
+    const payload = await recordAppDownloadSnapshot({
+      source,
+      downloadCount,
+      appUrl: sanitizeAnalyticsString(body.appUrl || body.app_url || config.uptodownAppUrl, 260),
+      metadata: sanitizeAnalyticsMetadata(body.metadata),
+    });
+    sendJson(req, res, 200, { status: 'ok', data: payload });
+    return;
+  }
+
+  if (req.method === 'POST' && segments.length === 2 && segments[0] === 'downloads' && segments[1] === 'sync-uptodown') {
+    assertAnalyticsDashboardAccess(req);
+    const body = await readJson(req).catch(() => ({}));
+    const appUrl = sanitizeAnalyticsString(body.appUrl || body.app_url || config.uptodownAppUrl, 260);
+    if (!appUrl) {
+      throw new HttpError(400, 'uptodown_url_missing', 'Set DOXA_UPTODOWN_APP_URL or pass appUrl in the request body.');
+    }
+
+    const downloadCount = await fetchUptodownDownloadCount(appUrl);
+    const payload = await recordAppDownloadSnapshot({
+      source: 'uptodown',
+      downloadCount,
+      appUrl,
+      metadata: { syncedAt: new Date().toISOString(), method: 'page_parse' },
+    });
+    sendJson(req, res, 200, { status: 'ok', data: payload, downloadCount });
     return;
   }
 
   if (req.method === 'GET' && segments.length === 0) {
     sendJson(req, res, 200, {
       status: 'ok',
-      message: 'Doxa notifications endpoint is active.',
+      message: 'Doxa analytics endpoint is active.',
       routes: [
-        'POST /notifications/price-alerts/register',
-        'POST /notifications/devices/disable',
-        'POST /notifications/price-alerts/dispatch',
-      ],
-    });
-    return;
-  }
-
-  if (req.method === 'GET' && segments.length === 0) {
-    sendJson(req, res, 200, {
-      status: 'ok',
-      message: 'Doxa notifications endpoint is active.',
-      routes: [
-        'POST /notifications/price-alerts/register',
-        'POST /notifications/devices/disable',
-        'POST /notifications/price-alerts/dispatch',
+        'GET /analytics/health',
+        'GET /analytics/dashboard',
+        'GET /analytics/downloads',
+        'POST /analytics/downloads',
+        'POST /analytics/downloads/sync-uptodown',
+        'POST /analytics/wallets',
+        'POST /analytics/transactions',
       ],
     });
     return;

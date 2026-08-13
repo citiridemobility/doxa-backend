@@ -115,15 +115,19 @@ EXPO_PUBLIC_TRANSACTION_HISTORY_ENDPOINT=https://your-backend-domain/history
 ```
 ## Supabase Metrics Analytics
 
-Run `backend/supabase/doxa_metrics_schema.sql` in the Supabase SQL editor before enabling the analytics endpoint. The schema stores wallet creation events and sanitized transaction metrics for swaps, bridges, Xchange, Bills, sends, and token transfers.
+Run `backend/supabase/doxa_metrics_schema.sql` only for a brand-new analytics project. For an existing Supabase metrics DB, run only `backend/supabase/doxa_metrics_analytics_dashboard_migration.sql` — it adds `amount_usd` / `platform_fee_usd`, the downloads table, and updated views without deleting wallet or transaction rows.
+
+`DOXA_UPTODOWN_APP_URL` is optional until the app is published on Uptodown. Leave it unset for now; use manual download counts later if needed.
 
 Required backend env:
 
 ```env
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key
+DOXA_ANALYTICS_DASHBOARD_SECRET=long_random_dashboard_secret
+# Optional later, after the app is on Uptodown:
+# DOXA_UPTODOWN_APP_URL=https://your-app.en.uptodown.com/android
 ```
-
 Expo app env:
 
 ```env
@@ -134,9 +138,15 @@ Routes:
 
 ```txt
 GET  /analytics/health
+GET  /analytics/dashboard?days=30   # requires x-doxa-analytics-secret
+GET  /analytics/downloads           # requires x-doxa-analytics-secret
+POST /analytics/downloads           # requires x-doxa-analytics-secret
+POST /analytics/downloads/sync-uptodown
 POST /analytics/wallets
 POST /analytics/transactions
 ```
+
+Use the separate `analytics-dashboard/` Vite app to visualize metrics in dark/light mode.
 
 Only non-custodial metrics are sent. The app never sends seed phrases, private keys, wallet passwords, biometric data, or raw authentication material to the backend. RLS is enabled on the metrics tables; `anon` and `authenticated` are revoked, and only the backend `service_role` can insert/update/read metrics through explicit policies.
 

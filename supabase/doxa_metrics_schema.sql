@@ -1,6 +1,9 @@
 ﻿-- Doxa Wallet Supabase metrics schema
 -- Run this in the Supabase SQL Editor for the dedicated Doxa analytics project.
 -- This stores public analytics metadata only. Never store seed phrases, private keys, passwords, or encrypted wallet payloads here.
+--
+-- Existing projects: do NOT re-run this file to add dashboard features.
+-- Use doxa_metrics_analytics_dashboard_migration.sql instead (additive ALTER / CREATE IF NOT EXISTS only).
 
 create extension if not exists pgcrypto;
 

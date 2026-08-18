@@ -86,6 +86,7 @@ select
   coalesce(sum(amount_usd), 0) as volume_usd,
   coalesce(sum(platform_fee_usd), 0) as fee_usd
 from public.doxa_wallet_transactions
+where lower(coalesce(status, 'completed')) not in ('failed', 'cancelled', 'canceled')
 group by 1, 2, 3, 4, 5;
 
 create or replace view public.doxa_transaction_status_summary as

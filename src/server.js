@@ -403,6 +403,38 @@ function sendJson(req, res, status, payload) {
   res.end(JSON.stringify(payload));
 }
 
+const LEGAL_DIR = resolve(__dirname, '../public/legal');
+const LEGAL_PAGES = {
+  '/legal/privacy-policy': 'privacy-policy.html',
+  '/legal/privacy-policy.html': 'privacy-policy.html',
+  '/privacy': 'privacy-policy.html',
+  '/privacy-policy': 'privacy-policy.html',
+  '/legal/terms-of-service': 'terms-of-service.html',
+  '/legal/terms-of-service.html': 'terms-of-service.html',
+  '/terms': 'terms-of-service.html',
+  '/terms-of-service': 'terms-of-service.html',
+};
+
+function trySendLegalPage(req, res, pathname) {
+  const fileName = LEGAL_PAGES[pathname];
+  if (!fileName) {
+    return false;
+  }
+
+  const filePath = resolve(LEGAL_DIR, fileName);
+  if (!filePath.startsWith(LEGAL_DIR) || !existsSync(filePath)) {
+    throw new HttpError(404, 'not_found', 'Legal page not found.');
+  }
+
+  const html = readFileSync(filePath, 'utf8');
+  res.writeHead(200, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'public, max-age=300',
+  });
+  res.end(html);
+  return true;
+}
+
 function assertCors(req) {
   if (req.headers.origin && !getAllowedOrigin(req)) {
     throw new HttpError(403, 'origin_not_allowed', 'This origin is not allowed.');
@@ -3716,6 +3748,47 @@ function toDayKey(value) {
   return String(value || '').slice(0, 10);
 }
 
+function buildAnalyticsAssetLabel(tx, metadata = {}, billType = null, summaryAmount = null) {
+  const category = String(tx.category || 'transaction').toLowerCase();
+  const tokenSymbol = sanitizeAnalyticsString(tx.token_symbol, 32);
+  const amountText = sanitizeAnalyticsString(tx.amount_text, 120);
+
+  if (category === 'bills') {
+    const billLabel =
+      billType === 'airtime'
+        ? 'Airtime'
+        : billType === 'data'
+          ? 'Data'
+          : billType === 'electricity'
+            ? 'Electricity'
+            : 'Bill';
+    return tokenSymbol ? `${billLabel} · ${tokenSymbol}` : billLabel;
+  }
+
+  if (category === 'swap') {
+    const fromSymbol = sanitizeAnalyticsString(metadata.fromSymbol || metadata.from_token, 32);
+    const toSymbol = sanitizeAnalyticsString(metadata.toSymbol || metadata.to_token, 32);
+    if (summaryAmount) return summaryAmount;
+    if (fromSymbol && toSymbol) return `${fromSymbol} → ${toSymbol}`;
+    return tokenSymbol || amountText || 'Swap';
+  }
+
+  if (category === 'bridge') {
+    if (summaryAmount) return summaryAmount;
+    return tokenSymbol || amountText || 'Bridge';
+  }
+
+  if (category === 'xchange') {
+    return tokenSymbol || sanitizeAnalyticsString(metadata.titleToken, 32) || amountText || 'Xchange';
+  }
+
+  if (category === 'token-transfer' || category === 'transaction') {
+    return tokenSymbol || amountText || 'Transfer';
+  }
+
+  return tokenSymbol || amountText || null;
+}
+
 function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
   const dayKeys = Array.from({ length: days }, (_, index) => toDayKey(startOfUtcDay(days - 1 - index)));
   const walletsByDay = Object.fromEntries(dayKeys.map((day) => [day, 0]));
@@ -3756,6 +3829,11 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
   let feeUsd = 0;
   let completedCount = 0;
 
+  const isFailedOrCancelledStatus = (status) => {
+    const normalized = String(status || '').toLowerCase().trim();
+    return normalized === 'failed' || normalized === 'cancelled' || normalized === 'canceled';
+  };
+
   const resolveXchangeMode = (tx) => {
     const metadata = tx.metadata && typeof tx.metadata === 'object' ? tx.metadata : {};
     const mode = String(metadata.mode || metadata.xchangeMode || '').toLowerCase();
@@ -3787,13 +3865,6 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
     const day = toDayKey(tx.occurred_at);
     if (day in txByDay) txByDay[day] += 1;
 
-    const amountUsd = Number(tx.amount_usd) || 0;
-    const platformFeeUsd = Number(tx.platform_fee_usd) || 0;
-    volumeUsd += amountUsd;
-    feeUsd += platformFeeUsd;
-    if (day in volumeByDay) volumeByDay[day] += amountUsd;
-    if (day in feesByDay) feesByDay[day] += platformFeeUsd;
-
     const category = tx.category || 'transaction';
     categoryCounts[category] = (categoryCounts[category] || 0) + 1;
     const status = tx.status || 'completed';
@@ -3802,13 +3873,24 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
     const network = tx.network_label || tx.network_id || 'Unknown';
     networkCounts[network] = (networkCounts[network] || 0) + 1;
 
-    if (category === 'xchange') {
+    const countsTowardVolume = !isFailedOrCancelledStatus(status);
+    const amountUsd = countsTowardVolume ? Number(tx.amount_usd) || 0 : 0;
+    const platformFeeUsd = countsTowardVolume ? Number(tx.platform_fee_usd) || 0 : 0;
+
+    if (countsTowardVolume) {
+      volumeUsd += amountUsd;
+      feeUsd += platformFeeUsd;
+      if (day in volumeByDay) volumeByDay[day] += amountUsd;
+      if (day in feesByDay) feesByDay[day] += platformFeeUsd;
+    }
+
+    if (category === 'xchange' && countsTowardVolume) {
       const mode = resolveXchangeMode(tx);
       xchangeModeCounts[mode] = (xchangeModeCounts[mode] || 0) + 1;
     }
 
     const tracked = resolveTrackedCategory(tx);
-    if (tracked && day in categoryDayCounts[tracked]) {
+    if (tracked && countsTowardVolume && day in categoryDayCounts[tracked]) {
       categoryDayCounts[tracked][day] += 1;
       categoryDayVolume[tracked][day] += amountUsd;
       categoryTotals[tracked].count += 1;
@@ -3849,10 +3931,17 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
   const recentTransactions = transactions
     .slice()
     .sort((a, b) => new Date(b.occurred_at) - new Date(a.occurred_at))
-    .slice(0, 40)
+    .slice(0, 500)
     .map((tx) => {
       const tracked = resolveTrackedCategory(tx);
       const xchangeMode = tx.category === 'xchange' ? resolveXchangeMode(tx) : null;
+      const metadata = tx.metadata && typeof tx.metadata === 'object' && !Array.isArray(tx.metadata) ? tx.metadata : {};
+      const billTypeRaw = String(metadata.billType || metadata.bill_type || '').toLowerCase();
+      const billType = ['airtime', 'data', 'electricity'].includes(billTypeRaw) ? billTypeRaw : null;
+      const summaryAmount =
+        sanitizeAnalyticsString(metadata.summaryAmount || metadata.summary_amount, 160) || null;
+      const assetLabel = buildAnalyticsAssetLabel(tx, metadata, billType, summaryAmount);
+
       return {
         eventId: tx.event_id,
         occurredAt: tx.occurred_at,
@@ -3872,6 +3961,9 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
         explorerUrl: tx.explorer_url || null,
         provider: tx.provider || null,
         reference: tx.reference || null,
+        assetLabel,
+        billType,
+        summaryAmount,
       };
     });
 
@@ -4259,6 +4351,10 @@ export async function handleRequest(req, res) {
 
     if (req.method === 'GET' && isHealthRoute) {
       sendJson(req, res, 200, { status: 'ok', service: 'doxa-backend' });
+      return;
+    }
+
+    if (req.method === 'GET' && trySendLegalPage(req, res, url.pathname)) {
       return;
     }
 

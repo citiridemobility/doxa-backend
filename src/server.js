@@ -3748,6 +3748,63 @@ function toDayKey(value) {
   return String(value || '').slice(0, 10);
 }
 
+const ANALYTICS_STATUS_RANK = {
+  completed: 60,
+  processing: 50,
+  pending: 40,
+  refunded: 30,
+  cancelled: 20,
+  canceled: 20,
+  failed: 10,
+};
+
+function getAnalyticsTransactionDedupeKey(tx) {
+  const wallet = String(tx.wallet_address || '').toLowerCase();
+  const category = String(tx.category || 'transaction').toLowerCase();
+  const hash = String(tx.tx_hash || '').toLowerCase().replace(/^0x/, '');
+  const reference = String(tx.reference || '').toLowerCase();
+  const eventId = String(tx.event_id || '').toLowerCase();
+
+  if (hash) return `hash:${wallet}:${category}:${hash}`;
+  if (reference) return `ref:${wallet}:${category}:${reference}`;
+  if (eventId) return `event:${eventId}`;
+  return `row:${wallet}:${category}:${tx.occurred_at || ''}:${tx.amount_text || ''}`;
+}
+
+function getAnalyticsStatusRank(status) {
+  const normalized = String(status || 'completed').toLowerCase().trim();
+  return ANALYTICS_STATUS_RANK[normalized] ?? 0;
+}
+
+function preferAnalyticsTransaction(current, candidate) {
+  if (!current) return candidate;
+
+  const statusDelta = getAnalyticsStatusRank(candidate.status) - getAnalyticsStatusRank(current.status);
+  if (statusDelta !== 0) return statusDelta > 0 ? candidate : current;
+
+  const candidateTime = Date.parse(String(candidate.occurred_at || '')) || 0;
+  const currentTime = Date.parse(String(current.occurred_at || '')) || 0;
+  if (candidateTime !== currentTime) return candidateTime > currentTime ? candidate : current;
+
+  const candidateUsd = Number(candidate.amount_usd) || 0;
+  const currentUsd = Number(current.amount_usd) || 0;
+  if (candidateUsd !== currentUsd) return candidateUsd > currentUsd ? candidate : current;
+
+  return current;
+}
+
+function dedupeAnalyticsTransactions(transactions) {
+  const byKey = new Map();
+
+  for (const tx of transactions || []) {
+    if (!tx || typeof tx !== 'object') continue;
+    const key = getAnalyticsTransactionDedupeKey(tx);
+    byKey.set(key, preferAnalyticsTransaction(byKey.get(key), tx));
+  }
+
+  return Array.from(byKey.values());
+}
+
 function buildAnalyticsAssetLabel(tx, metadata = {}, billType = null, summaryAmount = null) {
   const category = String(tx.category || 'transaction').toLowerCase();
   const tokenSymbol = sanitizeAnalyticsString(tx.token_symbol, 32);
@@ -3790,6 +3847,7 @@ function buildAnalyticsAssetLabel(tx, metadata = {}, billType = null, summaryAmo
 }
 
 function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
+  const uniqueTransactions = dedupeAnalyticsTransactions(transactions);
   const dayKeys = Array.from({ length: days }, (_, index) => toDayKey(startOfUtcDay(days - 1 - index)));
   const walletsByDay = Object.fromEntries(dayKeys.map((day) => [day, 0]));
   const txByDay = Object.fromEntries(dayKeys.map((day) => [day, 0]));
@@ -3861,7 +3919,7 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
     sourceCounts[source] = (sourceCounts[source] || 0) + 1;
   }
 
-  for (const tx of transactions) {
+  for (const tx of uniqueTransactions) {
     const day = toDayKey(tx.occurred_at);
     if (day in txByDay) txByDay[day] += 1;
 
@@ -3928,7 +3986,7 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
     bills: categoryDayCounts.bills[day] || 0,
   }));
 
-  const recentTransactions = transactions
+  const recentTransactions = uniqueTransactions
     .slice()
     .sort((a, b) => new Date(b.occurred_at) - new Date(a.occurred_at))
     .slice(0, 500)
@@ -3972,7 +4030,7 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
     generatedAt: new Date().toISOString(),
     totals: {
       wallets: wallets.length,
-      transactions: transactions.length,
+      transactions: uniqueTransactions.length,
       completedTransactions: completedCount,
       volumeUsd,
       feeUsd,

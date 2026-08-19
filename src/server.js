@@ -2182,7 +2182,19 @@ async function requestRailsRate({ network, token, amount, fiat }) {
 }
 
 function paycrestMessage(payload, fallback) {
-  return payload?.message || payload?.error?.message || payload?.error || payload?.errorMessage || payload?.data?.message || fallback;
+  const primary =
+    payload?.message || payload?.error?.message || payload?.error || payload?.errorMessage || undefined;
+  const detailMessage =
+    (typeof payload?.data?.message === 'string' && payload.data.message.trim()) ||
+    (typeof payload?.data?.error === 'string' && payload.data.error.trim()) ||
+    undefined;
+  const primaryText = typeof primary === 'string' ? primary.trim() : '';
+
+  if (primaryText && detailMessage && !primaryText.includes(detailMessage)) {
+    return `${primaryText}: ${detailMessage}`;
+  }
+
+  return primaryText || detailMessage || fallback;
 }
 
 function paycrestDetails(payload) {
@@ -2193,7 +2205,7 @@ function paycrestDetails(payload) {
 
   const data = payload.data;
   if (data && typeof data === 'object' && !Array.isArray(data)) {
-    const entries = Object.entries(data).filter(([key]) => !['message', 'status'].includes(key));
+    const entries = Object.entries(data).filter(([key]) => key !== 'status');
     if (entries.length > 0) return Object.fromEntries(entries);
   }
 
@@ -2385,9 +2397,18 @@ function sanitizePaycrestOrderBody(body) {
     sanitized.senderFeePercent = normalizePaycrestAmount(body.senderFeePercent, 'senderFeePercent');
   }
 
+  if (typeof body.rate === 'string' && body.rate.trim()) {
+    sanitized.rate = normalizePaycrestAmount(body.rate, 'rate');
+  }
+
   if (typeof body.reference === 'string' && body.reference.trim()) {
     sanitized.reference = body.reference.trim().slice(0, 128);
   }
+
+  const destinationProviderId =
+    (typeof destination.providerId === 'string' && destination.providerId.trim()) ||
+    (typeof destination.recipient?.providerId === 'string' && destination.recipient.providerId.trim()) ||
+    '';
 
   if (isOnramp) {
     sanitized.source = {
@@ -2402,6 +2423,7 @@ function sanitizePaycrestOrderBody(body) {
         address: normalizePaycrestEvmAddress(destination.recipient?.address, 'destination.recipient.address'),
         network: normalizePaycrestNetwork(destination.recipient?.network),
       },
+      ...(destinationProviderId ? { providerId: destinationProviderId } : {}),
     };
     return sanitized;
   }
@@ -2419,6 +2441,7 @@ function sanitizePaycrestOrderBody(body) {
       accountNameRequired: true,
       includeMemo: true,
     }),
+    ...(destinationProviderId ? { providerId: destinationProviderId } : {}),
   };
 
   return sanitized;

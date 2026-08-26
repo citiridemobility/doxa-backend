@@ -418,12 +418,13 @@ const completeClaimedDispatches = async (claimedIds) => {
     }
   }
 };
-const run = async () => {
+export const runPriceAlertScan = async () => {
   console.log('Starting Doxa price alert runner...');
 
   // First, claim any scheduled dispatch items from the DB queue via Supabase RPC.
   const claimedIds = [];
-  while (true) {
+  const maxClaimAttempts = 25;
+  for (let attempt = 0; attempt < maxClaimAttempts; attempt += 1) {
     let claimed;
     try {
       claimed = await fetchSupabase('rpc/claim_doxa_price_alerts_dispatch', { method: 'POST', body: {} });
@@ -434,8 +435,8 @@ const run = async () => {
 
     if (!Array.isArray(claimed) || claimed.length === 0) break;
     const row = claimed[0];
-    if (row && row.id) claimedIds.push(row.id);
-    // continue loop to gather any additional queued items
+    if (!row?.id) break;
+    claimedIds.push(row.id);
   }
 
   if (claimedIds.length === 0) {
@@ -447,14 +448,14 @@ const run = async () => {
   if (!Array.isArray(devices) || devices.length === 0) {
     console.log('No active notification devices found.');
     await completeClaimedDispatches(claimedIds);
-    return;
+    return { devices: 0, messages: 0 };
   }
 
   const allTokens = devices.flatMap((device) => Array.isArray(device.tokens) ? device.tokens : []);
   if (!allTokens.length) {
     console.log('No tokens registered for price alerts.');
     await completeClaimedDispatches(claimedIds);
-    return;
+    return { devices: devices.length, messages: 0 };
   }
 
   const prices = await buildMarketPrices(allTokens);
@@ -471,7 +472,7 @@ const run = async () => {
   if (!allMessages.length) {
     console.log('No price alert messages to dispatch.');
     await completeClaimedDispatches(claimedIds);
-    return;
+    return { devices: devices.length, messages: 0 };
   }
 
   const dispatchResult = await sendDispatchPayload(allMessages);
@@ -485,12 +486,24 @@ const run = async () => {
       console.error('Failed to mark dispatch id complete:', id, err instanceof Error ? err.message : err);
     }
   }
+
+  return { devices: devices.length, messages: allMessages.length, dispatchResult };
 };
 
-try {
-  await run();
-  process.exitCode = 0;
-} catch (error) {
-  console.error('Price alert runner failed:', error instanceof Error ? error.message : error);
-  process.exitCode = 1;
+const isMainModule = (() => {
+  try {
+    return Boolean(process.argv[1]) && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
+  } catch {
+    return false;
+  }
+})();
+
+if (isMainModule) {
+  try {
+    await runPriceAlertScan();
+    process.exitCode = 0;
+  } catch (error) {
+    console.error('Price alert runner failed:', error instanceof Error ? error.message : error);
+    process.exitCode = 1;
+  }
 }

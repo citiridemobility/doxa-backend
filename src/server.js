@@ -2,6 +2,8 @@ import { createServer } from 'node:http';
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -105,17 +107,20 @@ const HISTORY_ALCHEMY_NETWORK_BY_RECEIVE_NETWORK = {
 const HISTORY_TRANSFER_CATEGORIES = ['external', 'internal', 'erc20', 'erc721', 'erc1155'];
 const HISTORY_ALCHEMY_TRANSFER_CATEGORIES_BY_NETWORK = {
   'bnb-chain': ['external', 'erc20'],
+  base: ['external', 'erc20'],
+  arbitrum: ['external', 'erc20'],
 };
-const HISTORY_ALCHEMY_SUCCESS_CACHE_TTL_MS = 45 * 1000;
-const HISTORY_ALCHEMY_STALE_CACHE_TTL_MS = 10 * 60 * 1000;
-const HISTORY_ALCHEMY_RETRY_DELAY_MS = 750;
-const HISTORY_PAGE_SIZE_HEX = '0x64';
-const HISTORY_MAX_PAGES_PER_DIRECTION = 3;
+const HISTORY_ALCHEMY_SUCCESS_CACHE_TTL_MS = 2 * 60 * 1000;
+const HISTORY_ALCHEMY_STALE_CACHE_TTL_MS = 30 * 60 * 1000;
+const HISTORY_ALCHEMY_RETRY_DELAY_MS = 1500;
+const HISTORY_PAGE_SIZE_HEX = '0x32';
+const HISTORY_MAX_PAGES_PER_DIRECTION = 2;
 const HISTORY_DIRECTIONS = new Set(['incoming', 'outgoing']);
 const HISTORY_BSCSCAN_API_URL = 'https://api.bscscan.com/api';
 const HISTORY_ETHERSCAN_V2_API_URL = 'https://api.etherscan.io/v2/api';
 const HISTORY_ETHERSCAN_V2_CHAIN_ID_BY_NETWORK = {
   ethereum: 1,
+  'bnb-chain': 56,
   base: 8453,
   arbitrum: 42161,
 };
@@ -157,18 +162,24 @@ const HISTORY_PUBLIC_RPC_DEFAULT_URLS_BY_NETWORK = {
   ],
 };
 const HISTORY_PUBLIC_RPC_DEFAULT_LOOKBACK_BLOCKS_BY_NETWORK = {
-  'bnb-chain': 20000,
-  base: 40000,
-  arbitrum: 80000,
+  'bnb-chain': 8000,
+  base: 5000,
+  arbitrum: 12000,
 };
-const HISTORY_PUBLIC_RPC_BLOCK_CHUNK_SIZE = 2000;
+const HISTORY_PUBLIC_RPC_BLOCK_CHUNK_SIZE_BY_NETWORK = {
+  'bnb-chain': 400,
+  base: 500,
+  arbitrum: 1000,
+};
+const HISTORY_PUBLIC_RPC_BLOCK_CHUNK_SIZE = 500;
+const HISTORY_PUBLIC_RPC_MIN_BLOCK_CHUNK_SIZE = 25;
 const HISTORY_PUBLIC_RPC_MAX_LOGS = 100;
 const HISTORY_PUBLIC_RPC_SUCCESS_CACHE_TTL_MS = 60 * 1000;
 const HISTORY_PUBLIC_RPC_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const HISTORY_PUBLIC_RPC_ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 const HISTORY_PUBLIC_RPC_TIMEOUT_MS = 8000;
 const HISTORY_PUBLIC_RPC_MAX_URL_ATTEMPTS = 3;
-const HISTORY_PUBLIC_RPC_SCAN_BUDGET_MS = 15000;
+const HISTORY_PUBLIC_RPC_SCAN_BUDGET_MS = 25000;
 const MARKET_COIN_ID_BY_SYMBOL = {
   AVAX: 'avalanche-2',
   BNB: 'binancecoin',
@@ -321,6 +332,12 @@ const config = {
   railsFeeAddress: cleanEnvValue(process.env.RAILS_FEE_ADDRESS, 'RAILS_FEE_ADDRESS'),
   paycrestApiBaseUrl: normalizePaycrestApiBaseUrl(process.env.PAYCREST_API_BASE_URL),
   paycrestApiKey: cleanEnvValue(process.env.PAYCREST_API_KEY, 'PAYCREST_API_KEY'),
+  onboardApiBaseUrl: cleanEnvValue(
+    process.env.ONBOARD_API_BASE_URL || 'https://external.dev.onboardpay.co',
+    'ONBOARD_API_BASE_URL',
+  ).replace(/\/+$/, '') || 'https://external.dev.onboardpay.co',
+  onboardApiKey: cleanEnvValue(process.env.ONBOARD_API_KEY, 'ONBOARD_API_KEY'),
+  onboardApiSecret: cleanEnvValue(process.env.ONBOARD_API_SECRET, 'ONBOARD_API_SECRET'),
   coinGeckoPublicApiBaseUrl: cleanEnvValue(process.env.COINGECKO_PUBLIC_API_BASE_URL || 'https://api.coingecko.com/api/v3', 'COINGECKO_PUBLIC_API_BASE_URL').replace(/\/+$/, ''),
   coinGeckoProApiBaseUrl: cleanEnvValue(process.env.COINGECKO_PRO_API_BASE_URL || 'https://pro-api.coingecko.com/api/v3', 'COINGECKO_PRO_API_BASE_URL').replace(/\/+$/, ''),
   coinGeckoApiKey: cleanEnvValue(process.env.COINGECKO_API_KEY || process.env.COINGECKO_DEMO_API_KEY, 'COINGECKO_API_KEY'),
@@ -371,6 +388,11 @@ const config = {
   sogoBillsUsdtNgnRate: cleanEnvValue(process.env.SOGO_BILLS_USDT_NGN_RATE || process.env.SOGO_BILLS_STABLE_NGN_RATE || process.env.SOGO_BILLS_USDC_NGN_RATE, 'SOGO_BILLS_USDT_NGN_RATE'),
   analyticsDashboardSecret: cleanEnvValue(process.env.DOXA_ANALYTICS_DASHBOARD_SECRET, 'DOXA_ANALYTICS_DASHBOARD_SECRET'),
   uptodownAppUrl: cleanEnvValue(process.env.DOXA_UPTODOWN_APP_URL, 'DOXA_UPTODOWN_APP_URL'),
+  androidApkUrl: cleanEnvValue(
+    process.env.DOXA_ANDROID_APK_URL ||
+      'https://expo.dev/artifacts/eas/KBTpEz0-_fSQ2a2ecFdpPkkeEkGyupdBvAygwRwi9QI.apk',
+    'DOXA_ANDROID_APK_URL',
+  ),
 };
 
 function getAllowedOrigin(req) {
@@ -1402,7 +1424,28 @@ async function getAlchemyHistoryTransfers(request) {
 const historyPublicRpcTransferCache = new Map();
 const historyPublicRpcMetadataCache = new Map();
 const historyPublicRpcBlockCache = new Map();
+const historyPublicRpcProviderCooldownUntil = new Map();
 let historyPublicRpcRequestId = 1;
+
+function getHistoryPublicRpcProviderCooldownKey(url) {
+  try {
+    return new URL(url).host.toLowerCase();
+  } catch {
+    return String(url || '').toLowerCase();
+  }
+}
+
+function isHistoryPublicRpcProviderCoolingDown(url) {
+  const until = historyPublicRpcProviderCooldownUntil.get(getHistoryPublicRpcProviderCooldownKey(url)) || 0;
+  return until > Date.now();
+}
+
+function markHistoryPublicRpcProviderCooldown(url, durationMs = 60_000) {
+  historyPublicRpcProviderCooldownUntil.set(
+    getHistoryPublicRpcProviderCooldownKey(url),
+    Date.now() + durationMs,
+  );
+}
 
 function getConfiguredHistoryPublicRpcUrls(networkId) {
   const envKeysByNetwork = {
@@ -1417,13 +1460,18 @@ function getConfiguredHistoryPublicRpcUrls(networkId) {
   const configuredUrls = envValue
     .split(',')
     .map((url) => url.trim())
-    .filter((url) => url && !/alchemy\.com/i.test(url));
+    .filter(Boolean);
+
+  const alchemyNetwork = HISTORY_ALCHEMY_NETWORK_BY_RECEIVE_NETWORK[networkId];
+  const alchemyApiKey = cleanEnvValue(config.alchemyApiKey, 'ALCHEMY_API_KEY');
+  const alchemyRpcUrl =
+    alchemyNetwork && alchemyApiKey && !['demo', 'docs-demo', 'YOUR_API_KEY', 'your_alchemy_api_key_here'].includes(alchemyApiKey)
+      ? `https://${alchemyNetwork}.g.alchemy.com/v2/${alchemyApiKey}`
+      : '';
 
   return Array.from(
     new Set(
-      [...configuredUrls, ...(HISTORY_PUBLIC_RPC_DEFAULT_URLS_BY_NETWORK[networkId] || [])].filter(
-        (url) => !/alchemy\.com/i.test(url),
-      ),
+      [alchemyRpcUrl, ...configuredUrls, ...(HISTORY_PUBLIC_RPC_DEFAULT_URLS_BY_NETWORK[networkId] || [])].filter(Boolean),
     ),
   );
 }
@@ -1468,8 +1516,14 @@ function getHistoryRpcLogKey(log) {
 }
 
 async function requestHistoryPublicRpc(networkId, method, params) {
-  const urls = getConfiguredHistoryPublicRpcUrls(networkId).slice(0, HISTORY_PUBLIC_RPC_MAX_URL_ATTEMPTS);
+  const urls = getConfiguredHistoryPublicRpcUrls(networkId)
+    .filter((url) => !isHistoryPublicRpcProviderCoolingDown(url))
+    .slice(0, HISTORY_PUBLIC_RPC_MAX_URL_ATTEMPTS);
   let firstError;
+
+  if (!urls.length) {
+    throw new Error('No available public RPC providers for transaction history.');
+  }
 
   for (const url of urls) {
     const controller = new AbortController();
@@ -1488,14 +1542,25 @@ async function requestHistoryPublicRpc(networkId, method, params) {
         signal: controller.signal,
       });
       const payload = await readResponseJson(response);
+      const rpcMessage = payload?.error?.message || (!response.ok ? `RPC ${method} failed with ${response.status}` : '');
 
       if (!response.ok || payload?.error) {
-        throw new Error(payload?.error?.message || `RPC ${method} failed with ${response.status}`);
+        if (
+          response.status === 429 ||
+          isHistoryPublicRpcRateLimitError(rpcMessage) ||
+          /archive requests require/i.test(rpcMessage)
+        ) {
+          markHistoryPublicRpcProviderCooldown(url, /alchemy\.com/i.test(url) ? 120_000 : 45_000);
+        }
+        throw new Error(rpcMessage || `RPC ${method} failed with ${response.status}`);
       }
 
       return payload?.result;
     } catch (error) {
       firstError = firstError || error;
+      if (isHistoryPublicRpcRateLimitError(error)) {
+        markHistoryPublicRpcProviderCooldown(url, /alchemy\.com/i.test(url) ? 120_000 : 45_000);
+      }
     } finally {
       clearTimeout(timeout);
     }
@@ -1506,7 +1571,8 @@ async function requestHistoryPublicRpc(networkId, method, params) {
     method,
     message: firstError instanceof Error ? firstError.message : String(firstError),
   });
-  throw new HttpError(502, 'history_provider_failed', 'Transaction history is temporarily unavailable.');
+  const underlyingMessage = firstError instanceof Error ? firstError.message : String(firstError || 'RPC request failed');
+  throw new Error(underlyingMessage || 'Transaction history is temporarily unavailable.');
 }
 
 async function getHistoryPublicRpcLatestBlock(networkId) {
@@ -1583,21 +1649,107 @@ async function getHistoryPublicRpcTokenMetadata(networkId, tokenAddress) {
   return metadata;
 }
 
+function getHistoryPublicRpcBlockChunkSize(networkId) {
+  return HISTORY_PUBLIC_RPC_BLOCK_CHUNK_SIZE_BY_NETWORK[networkId] || HISTORY_PUBLIC_RPC_BLOCK_CHUNK_SIZE;
+}
+
+function isHistoryPublicRpcLogRangeError(error) {
+  const message = String(error?.message || error || '').toLowerCase();
+  return (
+    message.includes('limit exceeded') ||
+    message.includes('query returned more than') ||
+    message.includes('response size exceeded') ||
+    message.includes('block range is too large') ||
+    message.includes('exceed maximum block range') ||
+    message.includes('exceeded maximum block range') ||
+    message.includes('log response size exceeded') ||
+    message.includes('archive requests require') ||
+    message.includes('timeout') ||
+    message.includes('too many results')
+  );
+}
+
+function isHistoryPublicRpcRateLimitError(error) {
+  const message = String(error?.message || error || '').toLowerCase();
+  return message.includes('over rate limit') || message.includes('rate limit') || message.includes('429');
+}
+
+async function requestHistoryPublicRpcLogsWithSplit(networkId, filter, depth = 0) {
+  try {
+    const logs = await requestHistoryPublicRpc(networkId, 'eth_getLogs', [filter]);
+    return Array.isArray(logs) ? logs : [];
+  } catch (error) {
+    const fromBlock = parseRpcQuantity(filter.fromBlock);
+    const toBlock = parseRpcQuantity(filter.toBlock);
+    const span = toBlock - fromBlock;
+
+    // Rate limits get worse if we split/retry aggressively — soft-skip the chunk.
+    if (isHistoryPublicRpcRateLimitError(error)) {
+      if (depth < 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        return requestHistoryPublicRpcLogsWithSplit(networkId, filter, depth + 1);
+      }
+
+      const rateLimitError = new Error(error instanceof Error ? error.message : String(error));
+      rateLimitError.name = 'HistoryPublicRpcRateLimitError';
+      throw rateLimitError;
+    }
+
+    if (!isHistoryPublicRpcLogRangeError(error) || span <= 0 || depth >= 8) {
+      throw error;
+    }
+
+    if (span <= HISTORY_PUBLIC_RPC_MIN_BLOCK_CHUNK_SIZE) {
+      console.warn('Public RPC log chunk skipped after min range', {
+        networkId,
+        fromBlock: filter.fromBlock,
+        toBlock: filter.toBlock,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return [];
+    }
+
+    const mid = fromBlock + Math.floor(span / 2);
+    const left = await requestHistoryPublicRpcLogsWithSplit(
+      networkId,
+      { ...filter, fromBlock: toRpcQuantity(fromBlock), toBlock: toRpcQuantity(mid) },
+      depth + 1,
+    );
+    const right = await requestHistoryPublicRpcLogsWithSplit(
+      networkId,
+      { ...filter, fromBlock: toRpcQuantity(mid + 1), toBlock: toRpcQuantity(toBlock) },
+      depth + 1,
+    );
+    return [...left, ...right];
+  }
+}
+
 async function getHistoryPublicRpcTransferLogs(request) {
   const latestBlock = await getHistoryPublicRpcLatestBlock(request.networkId);
   const lookbackBlocks = getHistoryPublicRpcLookbackBlocks(request.networkId);
+  const chunkSize = getHistoryPublicRpcBlockChunkSize(request.networkId);
   const fromBlock = Math.max(0, latestBlock - lookbackBlocks);
   const walletTopic = padHistoryAddressTopic(request.walletAddress);
   const logsByKey = new Map();
   let successfulLogRequests = 0;
+  let failedLogRequests = 0;
+  let consecutiveRateLimits = 0;
   const scanStartedAt = Date.now();
 
-  for (let chunkEnd = latestBlock; chunkEnd >= fromBlock; chunkEnd -= HISTORY_PUBLIC_RPC_BLOCK_CHUNK_SIZE) {
+  for (let chunkEnd = latestBlock; chunkEnd >= fromBlock; chunkEnd -= chunkSize) {
     if (Date.now() - scanStartedAt > HISTORY_PUBLIC_RPC_SCAN_BUDGET_MS) {
       break;
     }
 
-    const chunkStart = Math.max(fromBlock, chunkEnd - HISTORY_PUBLIC_RPC_BLOCK_CHUNK_SIZE + 1);
+    if (consecutiveRateLimits >= 2) {
+      console.warn('Public RPC history scan aborted after repeated rate limits', {
+        networkId: request.networkId,
+        collectedLogs: logsByKey.size,
+      });
+      break;
+    }
+
+    const chunkStart = Math.max(fromBlock, chunkEnd - chunkSize + 1);
     const fromBlockHex = toRpcQuantity(chunkStart);
     const toBlockHex = toRpcQuantity(chunkEnd);
     const filters = [
@@ -1605,28 +1757,30 @@ async function getHistoryPublicRpcTransferLogs(request) {
       { fromBlock: fromBlockHex, toBlock: toBlockHex, topics: [HISTORY_PUBLIC_RPC_TRANSFER_TOPIC, null, walletTopic] },
     ];
 
-    const chunkResults = await Promise.allSettled(
-      filters.map((filter) => requestHistoryPublicRpc(request.networkId, 'eth_getLogs', [filter])),
-    );
-
-    chunkResults.forEach((result, index) => {
-      if (result.status === 'fulfilled') {
+    // Sequential filters reduce free-RPC rate-limit pressure vs Promise.all.
+    for (let index = 0; index < filters.length; index += 1) {
+      try {
+        const logs = await requestHistoryPublicRpcLogsWithSplit(request.networkId, filters[index]);
         successfulLogRequests += 1;
-        (Array.isArray(result.value) ? result.value : []).forEach((log) => {
+        consecutiveRateLimits = 0;
+        logs.forEach((log) => {
           const key = getHistoryRpcLogKey(log);
           if (key && !logsByKey.has(key)) logsByKey.set(key, log);
         });
-        return;
+      } catch (error) {
+        failedLogRequests += 1;
+        if (error?.name === 'HistoryPublicRpcRateLimitError' || isHistoryPublicRpcRateLimitError(error)) {
+          consecutiveRateLimits += 1;
+        }
+        console.warn('Public RPC log chunk failed', {
+          networkId: request.networkId,
+          fromBlock: fromBlockHex,
+          toBlock: toBlockHex,
+          filterIndex: index,
+          message: error instanceof Error ? error.message : String(error),
+        });
       }
-
-      console.warn('Public RPC log chunk failed', {
-        networkId: request.networkId,
-        fromBlock: fromBlockHex,
-        toBlock: toBlockHex,
-        filterIndex: index,
-        message: result.reason instanceof Error ? result.reason.message : String(result.reason),
-      });
-    });
+    }
 
     if (logsByKey.size >= HISTORY_PUBLIC_RPC_MAX_LOGS) {
       break;
@@ -1634,6 +1788,16 @@ async function getHistoryPublicRpcTransferLogs(request) {
   }
 
   if (successfulLogRequests === 0 && logsByKey.size === 0) {
+    // Prefer empty history over a hard 502 when public RPCs are rate-limited so
+    // explorer / Alchemy sources can still fulfill the client request.
+    if (failedLogRequests > 0) {
+      console.warn('Public RPC history returned no logs after provider failures', {
+        networkId: request.networkId,
+        walletAddress: request.walletAddress,
+        failedLogRequests,
+      });
+      return [];
+    }
     throw new HttpError(502, 'history_provider_failed', 'Transaction history is temporarily unavailable.');
   }
 
@@ -1729,38 +1893,40 @@ function getBscScanHistoryApiKey() {
 }
 
 function getEtherscanHistoryApiKey() {
-  const apiKey = cleanEnvValue(config.etherscanApiKey, 'ETHERSCAN_API_KEY');
-  if (!apiKey || ['demo', 'docs-demo', 'YOUR_API_KEY', 'your_etherscan_api_key_here', 'your_etherscan_v2_api_key_here'].includes(apiKey)) {
+  const apiKey = cleanEnvValue(
+    config.etherscanApiKey || config.bscScanApiKey,
+    'ETHERSCAN_API_KEY',
+  );
+  if (!apiKey || ['demo', 'docs-demo', 'YOUR_API_KEY', 'your_etherscan_api_key_here', 'your_etherscan_v2_api_key_here', 'your_bscscan_api_key_here'].includes(apiKey)) {
     return '';
   }
   return apiKey;
 }
 
 function getExplorerHistoryApiUrl(action, walletAddress, networkId) {
-  const apiKey = networkId === 'bnb-chain' ? getBscScanHistoryApiKey() : getEtherscanHistoryApiKey();
+  // BscScan/Etherscan V1 account endpoints are deprecated; use unified Etherscan V2.
+  const apiKey = getEtherscanHistoryApiKey();
 
   if (!apiKey) {
-    throw new HttpError(503, 'history_provider_unconfigured', 'Transaction history is temporarily unavailable.');
+    throw new HttpError(503, 'history_provider_unconfigured', 'Explorer history API key is not configured.');
   }
 
-  const url = new URL(networkId === 'bnb-chain' ? HISTORY_BSCSCAN_API_URL : HISTORY_ETHERSCAN_V2_API_URL);
+  const chainId = HISTORY_ETHERSCAN_V2_CHAIN_ID_BY_NETWORK[networkId];
+  if (!chainId) {
+    throw new HttpError(500, 'history_provider_failed', 'Unsupported history network.');
+  }
+
+  const url = new URL(HISTORY_ETHERSCAN_V2_API_URL);
+  url.searchParams.set('chainid', String(chainId));
   url.searchParams.set('module', 'account');
   url.searchParams.set('action', action);
   url.searchParams.set('address', walletAddress);
   url.searchParams.set('startblock', '0');
-  url.searchParams.set('endblock', networkId === 'bnb-chain' ? '999999999' : '99999999');
+  url.searchParams.set('endblock', '99999999');
   url.searchParams.set('page', '1');
   url.searchParams.set('offset', HISTORY_EXPLORER_PAGE_SIZE);
   url.searchParams.set('sort', 'desc');
   url.searchParams.set('apikey', apiKey);
-
-  if (networkId !== 'bnb-chain') {
-    const chainId = HISTORY_ETHERSCAN_V2_CHAIN_ID_BY_NETWORK[networkId];
-    if (!chainId) {
-      throw new HttpError(500, 'history_provider_failed', 'Unsupported history network.');
-    }
-    url.searchParams.set('chainid', String(chainId));
-  }
 
   return url.toString();
 }
@@ -1827,7 +1993,7 @@ async function handleHistoryProxy(req, res, url) {
       configured: Boolean(cleanEnvValue(config.alchemyApiKey, 'ALCHEMY_API_KEY')),
       providers: {
         alchemy: Boolean(cleanEnvValue(config.alchemyApiKey, 'ALCHEMY_API_KEY')),
-        bscscan: Boolean(getBscScanHistoryApiKey()),
+        bscscan: Boolean(getBscScanHistoryApiKey() || getEtherscanHistoryApiKey()),
         etherscan: Boolean(getEtherscanHistoryApiKey()),
       },
     });
@@ -1840,8 +2006,17 @@ async function handleHistoryProxy(req, res, url) {
       networkId: normalizeHistoryNetworkId(url.searchParams.get('networkId')),
       direction: normalizeHistoryDirection(url.searchParams.get('direction')),
     };
-    const transfers = await getAlchemyHistoryTransfers(request);
-    sendJson(req, res, 200, { data: { transfers, provider: 'alchemy', refreshedAt: Date.now() } });
+    try {
+      const transfers = await getAlchemyHistoryTransfers(request);
+      sendJson(req, res, 200, { data: { transfers, provider: 'alchemy', refreshedAt: Date.now() } });
+    } catch (error) {
+      console.warn('Alchemy history transfers failed', {
+        networkId: request.networkId,
+        walletAddress: request.walletAddress,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      sendJson(req, res, 200, { data: { transfers: [], provider: 'alchemy', refreshedAt: Date.now() } });
+    }
     return;
   }
 
@@ -3525,6 +3700,153 @@ async function handleRailsProxy(req, res, url) {
   throw new HttpError(404, 'not_found', 'Rails route not found.');
 }
 
+function getOnboardRouteSegments(url) {
+  const segments = url.pathname.split('/').filter(Boolean);
+  const onboardIndex = segments[0] === 'api' ? 1 : 0;
+
+  if (segments[onboardIndex] !== 'onboard') {
+    return [];
+  }
+
+  const pathSegments = segments.slice(onboardIndex + 1).map((segment) => decodeURIComponent(segment));
+  return pathSegments.length > 0 ? pathSegments : getVercelCatchAllSegments(url);
+}
+
+function assertOnboardConfigured() {
+  if (!config.onboardApiKey || !config.onboardApiSecret) {
+    throw new HttpError(500, 'onboard_not_configured', 'Set ONBOARD_API_KEY and ONBOARD_API_SECRET on the backend.');
+  }
+}
+
+function buildOnboardSignatureHeaders(body = {}) {
+  const timestamp = Math.ceil(Date.now() / 1000);
+  const signaturePayload = `t=${timestamp}&${JSON.stringify(body)}`;
+  const signature = createHmac('sha256', config.onboardApiSecret).update(signaturePayload).digest('hex');
+
+  return {
+    'x-api-key': config.onboardApiKey,
+    'x-signature': signature,
+    'x-timestamp': String(timestamp),
+  };
+}
+
+async function requestOnboard(path, { method = 'GET', body } = {}) {
+  assertOnboardConfigured();
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  const requestBody = method === 'GET' || method === 'HEAD' ? {} : (body ?? {});
+  const response = await fetch(`${config.onboardApiBaseUrl}${normalizedPath}`, {
+    method,
+    headers: {
+      Accept: 'application/json',
+      ...(method !== 'GET' && method !== 'HEAD' ? { 'Content-Type': 'application/json' } : {}),
+      ...buildOnboardSignatureHeaders(requestBody),
+    },
+    ...(method !== 'GET' && method !== 'HEAD' ? { body: JSON.stringify(requestBody) } : {}),
+  });
+  const payload = await readResponseJson(response);
+
+  if (!response.ok) {
+    const message = payload?.message || payload?.code || `Onboard request failed with ${response.status}`;
+    throw new HttpError(response.status || 502, 'onboard_request_failed', message);
+  }
+
+  return payload;
+}
+
+async function handleOnboardProxy(req, res, url) {
+  assertCors(req);
+  const segments = getOnboardRouteSegments(url);
+
+  if (req.method === 'GET' && segments.length === 1 && segments[0] === 'health') {
+    sendJson(req, res, 200, {
+      status: 'ok',
+      service: 'doxa-onboard-proxy',
+      configured: Boolean(config.onboardApiKey && config.onboardApiSecret),
+      baseUrl: config.onboardApiBaseUrl,
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && segments.length === 1 && segments[0] === 'info') {
+    const payload = await requestOnboard('/exchange/api/info');
+    sendJson(req, res, 200, { data: payload });
+    return;
+  }
+
+  if (req.method === 'GET' && segments.length === 2 && segments[0] === 'network-tokens') {
+    const assetCode = requirePaycrestString(segments[1], 'assetCode').toUpperCase();
+    const payload = await requestOnboard(`/ledger/assets/${encodeURIComponent(assetCode)}/network-tokens`);
+    sendJson(req, res, 200, { data: payload });
+    return;
+  }
+
+  if (req.method === 'GET' && segments.length === 1 && segments[0] === 'cash-payout-currencies') {
+    const payload = await requestOnboard('/ledger/cash-payments/currencies');
+    sendJson(req, res, 200, { data: payload });
+    return;
+  }
+
+  if (req.method === 'GET' && segments.length === 1 && segments[0] === 'fiat-beneficiaries') {
+    const payload = await requestOnboard(`/ledger/fiat-beneficiaries${url.search || ''}`);
+    sendJson(req, res, 200, { data: payload });
+    return;
+  }
+
+  if (req.method === 'POST' && segments.length === 1 && segments[0] === 'fiat-beneficiaries') {
+    const body = await readJson(req);
+    const payload = await requestOnboard('/ledger/fiat-beneficiaries', { method: 'POST', body });
+    sendJson(req, res, 201, { data: payload });
+    return;
+  }
+
+  if (req.method === 'GET' && segments.length === 2 && segments[0] === 'fiat-beneficiaries') {
+    const beneficiaryId = requirePaycrestString(segments[1], 'beneficiaryId');
+    const payload = await requestOnboard(`/ledger/fiat-beneficiaries/${encodeURIComponent(beneficiaryId)}`);
+    sendJson(req, res, 200, { data: payload });
+    return;
+  }
+
+  if (req.method === 'GET' && segments.length === 1 && segments[0] === 'offramp-accounts') {
+    const payload = await requestOnboard(`/ledger/offramp-accounts${url.search || ''}`);
+    sendJson(req, res, 200, { data: payload });
+    return;
+  }
+
+  if (req.method === 'POST' && segments.length === 1 && segments[0] === 'offramp-accounts') {
+    const body = await readJson(req);
+    const payload = await requestOnboard('/ledger/offramp-accounts', { method: 'POST', body });
+    sendJson(req, res, 200, { data: payload });
+    return;
+  }
+
+  if (req.method === 'GET' && segments.length === 2 && segments[0] === 'offramp-accounts') {
+    const offrampAccountId = requirePaycrestString(segments[1], 'offrampAccountId');
+    const payload = await requestOnboard(`/ledger/offramp-accounts/${encodeURIComponent(offrampAccountId)}`);
+    sendJson(req, res, 200, { data: payload });
+    return;
+  }
+
+  if (req.method === 'GET' && segments.length === 3 && segments[0] === 'offramp-accounts' && segments[2] === 'funding-address') {
+    const offrampAccountId = requirePaycrestString(segments[1], 'offrampAccountId');
+    const payload = await requestOnboard(
+      `/ledger/offramp-accounts/${encodeURIComponent(offrampAccountId)}/funding-address${url.search || ''}`,
+    );
+    sendJson(req, res, 200, { data: payload });
+    return;
+  }
+
+  if (req.method === 'GET' && segments.length === 3 && segments[0] === 'offramp-accounts' && segments[2] === 'transactions') {
+    const offrampAccountId = requirePaycrestString(segments[1], 'offrampAccountId');
+    const payload = await requestOnboard(
+      `/ledger/offramp-accounts/${encodeURIComponent(offrampAccountId)}/transactions${url.search || ''}`,
+    );
+    sendJson(req, res, 200, { data: payload });
+    return;
+  }
+
+  throw new HttpError(404, 'not_found', 'Onboard route not found.');
+}
+
 const ANALYTICS_WALLET_SOURCES = new Set(['created', 'imported', 'imported_seed', 'imported_private_key', 'recovered', 'unknown']);
 const ANALYTICS_TRANSACTION_CATEGORIES = new Set(['transaction', 'token-transfer', 'swap', 'bridge', 'xchange', 'bills']);
 const ANALYTICS_TRANSACTION_STATUSES = new Set(['pending', 'processing', 'completed', 'failed', 'refunded', 'cancelled']);
@@ -3601,6 +3923,16 @@ function sanitizeAnalyticsUsdAmount(value) {
 }
 
 const ANALYTICS_STABLE_SYMBOLS = new Set(['USDC', 'USDT', 'DAI', 'BUSD', 'USD']);
+const ANALYTICS_MAX_REASONABLE_FEE_USD = 10_000;
+const ANALYTICS_MAX_FEE_SHARE_OF_VOLUME = 0.25;
+
+function amountTextMentionsStable(amountText) {
+  return Boolean(
+    ANALYTICS_STABLE_SYMBOLS.has(
+      (String(amountText || '').toUpperCase().match(/\b(USDC|USDT|DAI|BUSD|USD)\b/)?.[1] || ''),
+    ),
+  );
+}
 
 function inferStableUsdAmount(amountText, tokenSymbol, explicitUsd) {
   const explicit = sanitizeAnalyticsUsdAmount(explicitUsd);
@@ -3610,10 +3942,60 @@ function inferStableUsdAmount(amountText, tokenSymbol, explicitUsd) {
   if (parsed.amountNumeric === undefined) return undefined;
 
   const symbol = sanitizeAnalyticsString(tokenSymbol, 32)?.toUpperCase();
-  const mentionsStable = ANALYTICS_STABLE_SYMBOLS.has(symbol || '')
-    || ANALYTICS_STABLE_SYMBOLS.has((parsed.amountText || '').toUpperCase().match(/\b(USDC|USDT|DAI|BUSD|USD)\b/)?.[1] || '');
+  const mentionsStable = ANALYTICS_STABLE_SYMBOLS.has(symbol || '') || amountTextMentionsStable(parsed.amountText);
 
   return mentionsStable ? parsed.amountNumeric : undefined;
+}
+
+// Platform fee text is often denominated in the swap input token (including meme coins).
+// Never infer USD from fee text using the transaction token symbol alone.
+function inferPlatformFeeUsdAmount(platformFeeText, tokenSymbol, explicitUsd, amountUsd) {
+  const explicit = sanitizeAnalyticsUsdAmount(explicitUsd);
+  if (explicit !== undefined) {
+    return sanitizePlatformFeeUsd(explicit, amountUsd);
+  }
+
+  const parsed = sanitizeAnalyticsAmount(platformFeeText);
+  if (parsed.amountNumeric === undefined) return undefined;
+
+  // Only treat fee text as USD when the fee string itself is clearly USD/stable-denominated.
+  if (!amountTextMentionsStable(parsed.amountText)) {
+    return undefined;
+  }
+
+  return sanitizePlatformFeeUsd(parsed.amountNumeric, amountUsd);
+}
+
+function sanitizePlatformFeeUsd(feeUsd, amountUsd) {
+  const fee = sanitizeAnalyticsUsdAmount(feeUsd);
+  if (fee === undefined || fee < 0) return undefined;
+
+  const volume = sanitizeAnalyticsUsdAmount(amountUsd);
+  if (fee > ANALYTICS_MAX_REASONABLE_FEE_USD) {
+    return undefined;
+  }
+
+  if (volume != null && volume > 0 && fee > volume * ANALYTICS_MAX_FEE_SHARE_OF_VOLUME && fee > 1) {
+    return undefined;
+  }
+
+  return fee;
+}
+
+function resolveDashboardPlatformFeeUsd({ category, platformFeeUsd, amountUsd, countsTowardVolume }) {
+  if (!countsTowardVolume) return 0;
+
+  let feeUsd = Number(platformFeeUsd) || 0;
+  const volumeUsd = Number(amountUsd) || 0;
+  const sanitized = sanitizePlatformFeeUsd(feeUsd, volumeUsd);
+  feeUsd = sanitized === undefined ? 0 : sanitized;
+
+  // Historical swap/bridge rows often omit platform_fee_usd; estimate the 0.3% Doxa fee.
+  if (feeUsd <= 0 && volumeUsd > 0 && (category === 'swap' || category === 'bridge')) {
+    feeUsd = Math.round(volumeUsd * 0.003 * 1e8) / 1e8;
+  }
+
+  return feeUsd;
 }
 
 function sanitizeAnalyticsMetadata(value) {
@@ -3654,10 +4036,14 @@ function sanitizeTransactionAnalyticsBody(body) {
     tokenSymbol,
     body.amountUsd ?? body.amount_usd,
   );
-  const platformFeeUsd = inferStableUsdAmount(
+  const explicitPlatformFeeUsd = sanitizeAnalyticsUsdAmount(
+    body.platformFeeUsd ?? body.platform_fee_usd ?? body.feeUsd ?? body.fee_usd,
+  );
+  const platformFeeUsd = inferPlatformFeeUsdAmount(
     platformFeeText,
     tokenSymbol,
-    body.platformFeeUsd ?? body.platform_fee_usd ?? body.feeUsd ?? body.fee_usd,
+    explicitPlatformFeeUsd,
+    amountUsd,
   );
 
   return {
@@ -3715,29 +4101,43 @@ async function upsertSupabaseRecord(tableName, record, onConflict) {
   return payload;
 }
 
-async function querySupabase(pathWithQuery) {
+async function querySupabase(pathWithQuery, { pageSize = 1000, maxRows = 20000 } = {}) {
   assertAnalyticsConfigured();
-  const url = `${config.supabaseUrl}/rest/v1/${pathWithQuery}`;
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: {
-      apikey: config.supabaseServiceRoleKey,
-      Authorization: `Bearer ${config.supabaseServiceRoleKey}`,
-      Accept: 'application/json',
-    },
-  });
-  const payload = await readResponseJson(response);
+  const rows = [];
+  let offset = 0;
 
-  if (!response.ok) {
-    console.error('Supabase analytics query failed', {
-      pathWithQuery,
-      status: response.status,
-      message: payload?.message || payload?.error || payload,
+  while (offset < maxRows) {
+    const end = Math.min(offset + pageSize - 1, maxRows - 1);
+    const separator = pathWithQuery.includes('?') ? '&' : '?';
+    const url = `${config.supabaseUrl}/rest/v1/${pathWithQuery}${separator}limit=${pageSize}&offset=${offset}`;
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        apikey: config.supabaseServiceRoleKey,
+        Authorization: `Bearer ${config.supabaseServiceRoleKey}`,
+        Accept: 'application/json',
+        Prefer: 'count=exact',
+        Range: `${offset}-${end}`,
+      },
     });
-    throw new HttpError(502, 'analytics_read_failed', 'Unable to load analytics right now.');
+    const payload = await readResponseJson(response);
+
+    if (!response.ok) {
+      console.error('Supabase analytics query failed', {
+        pathWithQuery,
+        status: response.status,
+        message: payload?.message || payload?.error || payload,
+      });
+      throw new HttpError(502, 'analytics_read_failed', 'Unable to load analytics right now.');
+    }
+
+    const batch = Array.isArray(payload) ? payload : [];
+    rows.push(...batch);
+    if (batch.length < pageSize) break;
+    offset += pageSize;
   }
 
-  return payload;
+  return rows;
 }
 
 function assertAnalyticsDashboardAccess(req) {
@@ -3869,6 +4269,129 @@ function buildAnalyticsAssetLabel(tx, metadata = {}, billType = null, summaryAmo
   return tokenSymbol || amountText || null;
 }
 
+function parsePaycrestFeeNumber(value) {
+  const numeric = Number(String(value ?? '').replace(/,/g, '').trim());
+  return Number.isFinite(numeric) && numeric >= 0 ? numeric : 0;
+}
+
+function isPaycrestFeeCountingStatus(status) {
+  const normalized = String(status || '').toLowerCase().trim();
+  return ['settled', 'fulfilled', 'completed', 'success'].includes(normalized);
+}
+
+async function fetchPaycrestSenderStatsFeeEarnings() {
+  if (!config.paycrestApiKey) return null;
+  try {
+    const statsPayload = await requestPaycrest('/sender/stats');
+    const stats = statsPayload?.data && typeof statsPayload.data === 'object' ? statsPayload.data : statsPayload;
+    const total = parsePaycrestFeeNumber(stats?.totalFeeEarnings ?? stats?.total_fee_earnings);
+    return total > 0 ? Math.round(total * 1e8) / 1e8 : null;
+  } catch (error) {
+    console.warn('Unable to fetch Paycrest sender stats for analytics', error?.message || error);
+    return null;
+  }
+}
+
+async function fetchPaycrestSenderFeesSince(sinceIso) {
+  if (!config.paycrestApiKey) return null;
+
+  const sinceMs = Date.parse(sinceIso);
+  let page = 1;
+  let feeUsd = 0;
+  const maxPages = 50;
+  const statsTotal = await fetchPaycrestSenderStatsFeeEarnings();
+
+  try {
+    while (page <= maxPages) {
+      const payload = await requestPaycrest(`/sender/orders?page=${page}&pageSize=100`);
+      const data = payload?.data && typeof payload.data === 'object' ? payload.data : payload;
+      const orders = Array.isArray(data?.orders)
+        ? data.orders
+        : Array.isArray(data)
+          ? data
+          : Array.isArray(payload?.orders)
+            ? payload.orders
+            : [];
+
+      if (!orders.length) break;
+
+      for (const order of orders) {
+        const createdMs = Date.parse(
+          order.createdAt || order.created_at || order.updatedAt || order.updated_at || '',
+        );
+        if (Number.isFinite(sinceMs) && Number.isFinite(createdMs) && createdMs < sinceMs) {
+          continue;
+        }
+        if (!isPaycrestFeeCountingStatus(order.status)) continue;
+        feeUsd += parsePaycrestFeeNumber(order.senderFee ?? order.sender_fee);
+      }
+
+      const pageSize = Number(data?.pageSize) || orders.length;
+      const total = Number(data?.total);
+      if (orders.length < pageSize) break;
+      if (Number.isFinite(total) && page * pageSize >= total) break;
+      page += 1;
+    }
+
+    const orderSum = Math.round(feeUsd * 1e8) / 1e8;
+    // Prefer Paycrest dashboard totals when our settled-order sum matches/exceeds them
+    // (avoids overcounting pending/legacy statuses) or when the window likely covers all history.
+    if (statsTotal != null) {
+      if (orderSum <= 0) return statsTotal;
+      if (orderSum >= statsTotal) return statsTotal;
+      return orderSum;
+    }
+    return orderSum;
+  } catch (error) {
+    console.warn('Unable to sum Paycrest order fees for analytics', error?.message || error);
+    return statsTotal;
+  }
+}
+
+function reconcileDashboardPaycrestFees(summary, paycrestFeeUsd) {
+  if (paycrestFeeUsd == null || !Number.isFinite(paycrestFeeUsd)) return summary;
+
+  const xchangeFeeFromDb =
+    (Number(summary.totals?.xchangeBuy?.feeUsd) || 0) + (Number(summary.totals?.xchangeSell?.feeUsd) || 0);
+  const feeGap = Math.max(0, paycrestFeeUsd - xchangeFeeFromDb);
+  if (feeGap <= 0) return summary;
+
+  const buyCount = Number(summary.totals?.xchangeBuy?.count) || 0;
+  const sellCount = Number(summary.totals?.xchangeSell?.count) || 0;
+  const totalXchangeCount = buyCount + sellCount;
+  const buyShare = totalXchangeCount > 0 ? buyCount / totalXchangeCount : 0.5;
+  const buyGap = Math.round(feeGap * buyShare * 1e8) / 1e8;
+  const sellGap = Math.round((feeGap - buyGap) * 1e8) / 1e8;
+
+  const feeSeries = Array.isArray(summary.series?.feeUsdByDay)
+    ? summary.series.feeUsdByDay.map((point, index, list) =>
+        index === list.length - 1
+          ? { ...point, value: Math.round(((Number(point.value) || 0) + feeGap) * 1e8) / 1e8 }
+          : point,
+      )
+    : summary.series?.feeUsdByDay;
+
+  return {
+    ...summary,
+    totals: {
+      ...summary.totals,
+      feeUsd: Math.round(((Number(summary.totals.feeUsd) || 0) + feeGap) * 1e8) / 1e8,
+      xchangeBuy: {
+        ...summary.totals.xchangeBuy,
+        feeUsd: Math.round(((Number(summary.totals.xchangeBuy?.feeUsd) || 0) + buyGap) * 1e8) / 1e8,
+      },
+      xchangeSell: {
+        ...summary.totals.xchangeSell,
+        feeUsd: Math.round(((Number(summary.totals.xchangeSell?.feeUsd) || 0) + sellGap) * 1e8) / 1e8,
+      },
+    },
+    series: {
+      ...summary.series,
+      feeUsdByDay: feeSeries,
+    },
+  };
+}
+
 function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
   const uniqueTransactions = dedupeAnalyticsTransactions(transactions);
   const dayKeys = Array.from({ length: days }, (_, index) => toDayKey(startOfUtcDay(days - 1 - index)));
@@ -3956,7 +4479,12 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
 
     const countsTowardVolume = !isFailedOrCancelledStatus(status);
     const amountUsd = countsTowardVolume ? Number(tx.amount_usd) || 0 : 0;
-    const platformFeeUsd = countsTowardVolume ? Number(tx.platform_fee_usd) || 0 : 0;
+    const platformFeeUsd = resolveDashboardPlatformFeeUsd({
+      category,
+      platformFeeUsd: tx.platform_fee_usd,
+      amountUsd,
+      countsTowardVolume,
+    });
 
     if (countsTowardVolume) {
       volumeUsd += amountUsd;
@@ -4036,7 +4564,12 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
         tokenSymbol: tx.token_symbol || null,
         amountText: tx.amount_text || null,
         amountUsd: Number(tx.amount_usd) || 0,
-        platformFeeUsd: Number(tx.platform_fee_usd) || 0,
+        platformFeeUsd: resolveDashboardPlatformFeeUsd({
+          category: tx.category || 'transaction',
+          platformFeeUsd: tx.platform_fee_usd,
+          amountUsd: Number(tx.amount_usd) || 0,
+          countsTowardVolume: true,
+        }),
         walletAddress: tx.wallet_address || null,
         txHash: tx.tx_hash || null,
         explorerUrl: tx.explorer_url || null,
@@ -4058,6 +4591,11 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
       volumeUsd,
       feeUsd,
       uptodownDownloads: latestDownloads.uptodown?.downloadCount || 0,
+      androidDownloads:
+        latestDownloads.apk?.downloadCount ??
+        latestDownloads.website?.downloadCount ??
+        latestDownloads.uptodown?.downloadCount ??
+        0,
       swap: categoryTotals.swap,
       bridge: categoryTotals.bridge,
       xchangeBuy: categoryTotals['xchange-buy'],
@@ -4107,25 +4645,32 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
 
 async function buildAnalyticsDashboardSummary(days) {
   const since = startOfUtcDay(days - 1);
-  const [wallets, transactions, downloads] = await Promise.all([
+  const [wallets, transactions, downloads, paycrestFeeUsd] = await Promise.all([
     querySupabase(`doxa_wallet_creations?select=wallet_address,source,platform,app_version,created_at,client_created_at&created_at=gte.${encodeURIComponent(since)}&order=created_at.asc`),
     querySupabase(`doxa_wallet_transactions?select=event_id,wallet_address,tx_hash,category,status,direction,network_id,network_label,token_symbol,amount_text,amount_numeric,amount_usd,platform_fee_text,platform_fee_usd,provider,reference,explorer_url,occurred_at,metadata&occurred_at=gte.${encodeURIComponent(since)}&order=occurred_at.asc`),
     querySupabase('doxa_app_downloads?select=source,download_count,delta_count,app_url,recorded_at,metadata&order=recorded_at.desc&limit=200'),
+    fetchPaycrestSenderFeesSince(since).catch((error) => {
+      console.warn('Paycrest fee reconciliation skipped', error?.message || error);
+      return null;
+    }),
   ]);
 
-  return aggregateDashboardMetrics({
+  const summary = aggregateDashboardMetrics({
     wallets: Array.isArray(wallets) ? wallets : [],
     transactions: Array.isArray(transactions) ? transactions : [],
     downloads: Array.isArray(downloads) ? downloads : [],
     days,
   });
+
+  return reconcileDashboardPaycrestFees(summary, paycrestFeeUsd);
 }
 
 function parseUptodownDownloadCount(html) {
   const patterns = [
     /itemprop=["']interactionCount["'][^>]*content=["'](?:UserDownloads|Downloads):(\d+)/i,
-    /"userInteractionCount"\s*:\s*(\d+)/i,
+    /"userInteractionCount"\s*:\s*"?(\d+)"?/i,
     /data-downloads=["'](\d+)["']/i,
+    /<span>\s*(\d[\d,]*)\s*<\/span>\s*<span>\s*downloads/i,
     /(\d[\d,]*)\s*(?:downloads|descargas)/i,
   ];
 
@@ -4181,6 +4726,140 @@ async function recordAppDownloadSnapshot({ source, downloadCount, appUrl, metada
   );
 }
 
+async function incrementAndroidDownloadCount(metadata = {}) {
+  const previousRows = await querySupabase(
+    'doxa_app_downloads?select=download_count&source=eq.apk&order=recorded_at.desc&limit=1',
+  );
+  const previousCount = Array.isArray(previousRows) && previousRows[0] ? Number(previousRows[0].download_count) : 0;
+  const nextCount = (Number.isFinite(previousCount) ? previousCount : 0) + 1;
+
+  return recordAppDownloadSnapshot({
+    source: 'apk',
+    downloadCount: nextCount,
+    appUrl: config.androidApkUrl,
+    metadata: {
+      method: 'completed_transfer',
+      ...metadata,
+    },
+  });
+}
+
+async function handleAndroidApkDownload(req, res) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    throw new HttpError(405, 'method_not_allowed', 'Use GET to download the Android APK.');
+  }
+
+  if (!config.androidApkUrl) {
+    throw new HttpError(503, 'apk_not_configured', 'Set DOXA_ANDROID_APK_URL on the backend.');
+  }
+
+  // Range / partial requests are resume helpers, not completed installs.
+  if (req.headers.range) {
+    throw new HttpError(416, 'range_not_supported', 'Partial downloads are not supported. Retry the full APK download.');
+  }
+
+  const upstream = await fetch(config.androidApkUrl, {
+    method: req.method,
+    headers: {
+      Accept: 'application/vnd.android.package-archive,application/octet-stream,*/*',
+      'User-Agent': 'DoxaWalletDownloadProxy/1.0',
+    },
+    redirect: 'follow',
+  });
+
+  if (!upstream.ok) {
+    throw new HttpError(502, 'apk_fetch_failed', `Unable to fetch the Android build (${upstream.status}).`);
+  }
+
+  const contentLengthHeader = upstream.headers.get('content-length');
+  const expectedBytes = contentLengthHeader ? Number(contentLengthHeader) : null;
+  const contentType = upstream.headers.get('content-type') || 'application/vnd.android.package-archive';
+  const headers = {
+    'Content-Type': contentType,
+    'Content-Disposition': 'attachment; filename="doxa-wallet.apk"',
+    'Cache-Control': 'no-store',
+  };
+
+  if (Number.isFinite(expectedBytes) && expectedBytes > 0) {
+    headers['Content-Length'] = String(expectedBytes);
+  }
+
+  setCors(req, res);
+
+  if (req.method === 'HEAD') {
+    res.writeHead(200, headers);
+    res.end();
+    return;
+  }
+
+  if (!upstream.body) {
+    throw new HttpError(502, 'apk_fetch_failed', 'The Android build response had no body.');
+  }
+
+  res.writeHead(200, headers);
+
+  let transferredBytes = 0;
+  let clientAborted = false;
+
+  const onClientClose = () => {
+    if (!res.writableEnded) {
+      clientAborted = true;
+    }
+  };
+  req.on('aborted', onClientClose);
+  res.on('close', onClientClose);
+
+  const upstreamStream = Readable.fromWeb(upstream.body);
+  upstreamStream.on('data', (chunk) => {
+    transferredBytes += chunk.length;
+  });
+
+  try {
+    await pipeline(upstreamStream, res);
+  } catch (error) {
+    clientAborted = true;
+    if (!res.headersSent) {
+      throw error;
+    }
+    console.warn('Android APK download stream ended early', {
+      transferredBytes,
+      expectedBytes,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return;
+  } finally {
+    req.off('aborted', onClientClose);
+    res.off('close', onClientClose);
+  }
+
+  const transferLooksComplete =
+    !clientAborted &&
+    res.writableEnded &&
+    (expectedBytes == null ||
+      !Number.isFinite(expectedBytes) ||
+      expectedBytes <= 0 ||
+      transferredBytes >= expectedBytes * 0.99);
+
+  if (!transferLooksComplete) {
+    console.warn('Android APK download incomplete; not counted', {
+      transferredBytes,
+      expectedBytes,
+      clientAborted,
+    });
+    return;
+  }
+
+  try {
+    await incrementAndroidDownloadCount({
+      transferredBytes,
+      expectedBytes,
+      userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'].slice(0, 180) : undefined,
+    });
+  } catch (error) {
+    console.error('Failed to record completed Android download', error);
+  }
+}
+
 async function handleAnalyticsProxy(req, res, url) {
   assertCors(req);
   const segments = getAnalyticsRouteSegments(url);
@@ -4214,7 +4893,7 @@ async function handleAnalyticsProxy(req, res, url) {
   if (req.method === 'POST' && segments.length === 1 && segments[0] === 'downloads') {
     assertAnalyticsDashboardAccess(req);
     const body = await readJson(req);
-    const source = sanitizeAnalyticsEnum(body.source, new Set(['uptodown', 'play_store', 'app_store', 'apk', 'other']), 'uptodown');
+    const source = sanitizeAnalyticsEnum(body.source, new Set(['uptodown', 'play_store', 'app_store', 'apk', 'website', 'other']), 'apk');
     const downloadCountRaw = body.downloadCount ?? body.download_count ?? body.count;
     const downloadCount = Number(String(downloadCountRaw ?? '').replace(/,/g, ''));
     if (!Number.isInteger(downloadCount) || downloadCount < 0) {
@@ -4375,6 +5054,14 @@ async function handleNotificationsProxy(req, res, url) {
     return;
   }
 
+  if (req.method === 'POST' && segments.length === 2 && segments[0] === 'price-alerts' && segments[1] === 'run') {
+    assertNotificationsRunnerSecret(req);
+    const { runPriceAlertScan } = await import('./price-alerts-runner.js');
+    const result = await runPriceAlertScan();
+    sendJson(req, res, 200, { status: 'ok', data: result ?? { ok: true } });
+    return;
+  }
+
   if (req.method === 'POST' && segments.length === 2 && segments[0] === 'price-alerts' && segments[1] === 'dispatch') {
     assertNotificationsRunnerSecret(req);
     const body = await readJson(req);
@@ -4414,8 +5101,14 @@ export async function handleRequest(req, res) {
   try {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const isHealthRoute = url.pathname === '/health' || url.pathname === '/api/health';
+    const isAndroidDownloadRoute =
+      url.pathname === '/download/android' ||
+      url.pathname === '/api/download/android' ||
+      url.pathname === '/downloads/android' ||
+      url.pathname === '/api/downloads/android';
     const isRailsRoute = url.pathname === '/rails' || url.pathname.startsWith('/rails/') || url.pathname === '/api/rails' || url.pathname.startsWith('/api/rails/');
     const isPaycrestRoute = url.pathname === '/paycrest' || url.pathname.startsWith('/paycrest/') || url.pathname === '/api/paycrest' || url.pathname.startsWith('/api/paycrest/');
+    const isOnboardRoute = url.pathname === '/onboard' || url.pathname.startsWith('/onboard/') || url.pathname === '/api/onboard' || url.pathname.startsWith('/api/onboard/');
     const isSogoRoute = url.pathname === '/sogo' || url.pathname.startsWith('/sogo/') || url.pathname === '/api/sogo' || url.pathname.startsWith('/api/sogo/');
     const isAnalyticsRoute = url.pathname === '/analytics' || url.pathname.startsWith('/analytics/') || url.pathname === '/api/analytics' || url.pathname.startsWith('/api/analytics/');
     const isNotificationsRoute = url.pathname === '/notifications' || url.pathname.startsWith('/notifications/') || url.pathname === '/api/notifications' || url.pathname.startsWith('/api/notifications/');
@@ -4435,6 +5128,11 @@ export async function handleRequest(req, res) {
       return;
     }
 
+    if ((req.method === 'GET' || req.method === 'HEAD') && isAndroidDownloadRoute) {
+      await handleAndroidApkDownload(req, res);
+      return;
+    }
+
     if (req.method === 'GET' && trySendLegalPage(req, res, url.pathname)) {
       return;
     }
@@ -4446,6 +5144,11 @@ export async function handleRequest(req, res) {
 
     if (isPaycrestRoute) {
       await handlePaycrestProxy(req, res, url);
+      return;
+    }
+
+    if (isOnboardRoute) {
+      await handleOnboardProxy(req, res, url);
       return;
     }
 
@@ -4482,9 +5185,44 @@ export async function handleRequest(req, res) {
 
 export default handleRequest;
 
+const PRICE_ALERT_SCAN_INTERVAL_MS = 15 * 60 * 1000;
+let priceAlertScanInFlight = false;
+
+const scheduleBackgroundPriceAlertScans = () => {
+  if (!config.notificationsCronSecret || process.env.VERCEL) {
+    return;
+  }
+
+  const runScheduledScan = async () => {
+    if (priceAlertScanInFlight) return;
+    priceAlertScanInFlight = true;
+    try {
+      const { runPriceAlertScan } = await import('./price-alerts-runner.js');
+      await runPriceAlertScan();
+    } catch (error) {
+      console.warn('Scheduled price alert scan failed', error instanceof Error ? error.message : error);
+    } finally {
+      priceAlertScanInFlight = false;
+    }
+  };
+
+  // Initial delay so the server can finish bootstrapping before the first scan.
+  setTimeout(() => {
+    void runScheduledScan();
+    setInterval(() => {
+      void runScheduledScan();
+    }, PRICE_ALERT_SCAN_INTERVAL_MS);
+  }, 45_000);
+};
+
 if (!process.env.VERCEL && process.argv[1] === fileURLToPath(import.meta.url)) {
   const server = createServer(handleRequest);
+  // APK proxy transfers can take several minutes on slow mobile networks.
+  server.requestTimeout = 0;
+  server.headersTimeout = 120000;
+  server.timeout = 0;
   server.listen(config.port, () => {
     console.log(`Doxa backend listening on http://localhost:${config.port}`);
+    scheduleBackgroundPriceAlertScans();
   });
 }

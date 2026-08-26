@@ -117,7 +117,7 @@ EXPO_PUBLIC_TRANSACTION_HISTORY_ENDPOINT=https://your-backend-domain/history
 
 Run `backend/supabase/doxa_metrics_schema.sql` only for a brand-new analytics project. For an existing Supabase metrics DB, run only `backend/supabase/doxa_metrics_analytics_dashboard_migration.sql` — it adds `amount_usd` / `platform_fee_usd`, the downloads table, and updated views without deleting wallet or transaction rows.
 
-`DOXA_UPTODOWN_APP_URL` is optional until the app is published on Uptodown. Leave it unset for now; use manual download counts later if needed.
+`DOXA_UPTODOWN_APP_URL` should point at the live Uptodown app page so the dashboard can sync install counts.
 
 Required backend env:
 
@@ -125,8 +125,7 @@ Required backend env:
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key
 DOXA_ANALYTICS_DASHBOARD_SECRET=long_random_dashboard_secret
-# Optional later, after the app is on Uptodown:
-# DOXA_UPTODOWN_APP_URL=https://your-app.en.uptodown.com/android
+DOXA_UPTODOWN_APP_URL=https://doxa-wallet.en.uptodown.com/android
 ```
 Expo app env:
 
@@ -171,6 +170,7 @@ Routes:
 ```txt
 POST /notifications/price-alerts/register
 POST /notifications/devices/disable
+POST /notifications/price-alerts/run
 POST /notifications/price-alerts/dispatch
 ```
 

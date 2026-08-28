@@ -4522,6 +4522,17 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
     }
   }
 
+  const websiteDownloadCount =
+    latestDownloads.apk?.downloadCount ??
+    latestDownloads.website?.downloadCount ??
+    0;
+  const totalDownloads =
+    (latestDownloads.uptodown?.downloadCount || 0) +
+    websiteDownloadCount +
+    (latestDownloads.play_store?.downloadCount || 0) +
+    (latestDownloads.app_store?.downloadCount || 0) +
+    (latestDownloads.other?.downloadCount || 0);
+
   const toSeries = (map) => dayKeys.map((day) => ({ day, value: map[day] || 0 }));
   const toPie = (map) => Object.entries(map)
     .filter(([, value]) => Number(value) > 0)
@@ -4591,6 +4602,8 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
       volumeUsd,
       feeUsd,
       uptodownDownloads: latestDownloads.uptodown?.downloadCount || 0,
+      websiteDownloads: websiteDownloadCount,
+      totalDownloads,
       androidDownloads:
         latestDownloads.apk?.downloadCount ??
         latestDownloads.website?.downloadCount ??

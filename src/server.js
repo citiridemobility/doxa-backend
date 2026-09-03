@@ -5031,20 +5031,43 @@ async function handleNotificationsProxy(req, res, url) {
       throw new HttpError(400, 'invalid_request', 'expoPushToken is required.');
     }
 
+    const rawTokens = Array.isArray(body.tokens) ? body.tokens : [];
+    const tokens = rawTokens
+      .map((token) => {
+        if (!token || typeof token !== 'object') return null;
+        const currentPrice = Number(token.currentPrice);
+        if (!Number.isFinite(currentPrice) || currentPrice <= 0) return null;
+
+        const previousPrice = Number(token.previousPrice);
+        return {
+          tokenId: sanitizeNotificationString(token.tokenId),
+          symbol: sanitizeNotificationString(token.symbol),
+          name: sanitizeNotificationString(token.name),
+          networkId: sanitizeNotificationString(token.networkId),
+          networkLabel: sanitizeNotificationString(token.networkLabel),
+          tokenAddress: sanitizeNotificationString(token.tokenAddress).toLowerCase() || undefined,
+          currentPrice,
+          previousPrice: Number.isFinite(previousPrice) && previousPrice > 0 ? previousPrice : currentPrice,
+          priceLabel: sanitizeNotificationString(token.priceLabel),
+        };
+      })
+      .filter(Boolean);
+
     const record = {
       expo_push_token: expoPushToken,
       wallet_address: sanitizeNotificationString(body.walletAddress),
       platform: sanitizeNotificationString(body.platform),
       app_version: sanitizeNotificationString(body.appVersion),
-      currency: sanitizeNotificationString(body.currency).toUpperCase() || 'USD',
-      tokens: Array.isArray(body.tokens) ? body.tokens : [],
+      // Background scanner always prices in USD.
+      currency: 'USD',
+      tokens,
       enabled: true,
       last_registered_at: new Date().toISOString(),
       last_updated_at: new Date().toISOString(),
     };
 
     const payload = await upsertSupabaseRecord('doxa_notification_devices', record, 'expo_push_token');
-    sendJson(req, res, 200, { status: 'ok', data: payload });
+    sendJson(req, res, 200, { status: 'ok', data: payload, tokenCount: tokens.length });
     return;
   }
 
@@ -5090,6 +5113,7 @@ async function handleNotificationsProxy(req, res, url) {
         body: sanitizeNotificationString(message.body),
         data: message.data || {},
         sound: 'default',
+        priority: 'high',
         ...(message.channelId ? { channelId: sanitizeNotificationString(message.channelId) } : {}),
       };
       return sendExpoPushNotification(payload);
@@ -5198,7 +5222,7 @@ export async function handleRequest(req, res) {
 
 export default handleRequest;
 
-const PRICE_ALERT_SCAN_INTERVAL_MS = 15 * 60 * 1000;
+const PRICE_ALERT_SCAN_INTERVAL_MS = 5 * 60 * 1000;
 let priceAlertScanInFlight = false;
 
 const scheduleBackgroundPriceAlertScans = () => {

@@ -78,8 +78,21 @@ const MARKET_COIN_ID_BY_PLATFORM_CONTRACT = {
   },
   'arbitrum-one': {
     '0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9': 'tether',
-    '0xaf88d065e77cc223932e3a432268e5831ae4d46': 'usd-coin',
+    '0xaf88d065e77c45693c7331f11c0c4181e9c9c2c5': 'usd-coin',
   },
+};
+
+const NETWORK_LABEL_BY_ID = {
+  'bnb-chain': 'BNB Chain',
+  ethereum: 'Ethereum',
+  base: 'Base',
+  optimism: 'Optimism',
+  arbitrum: 'Arbitrum',
+  'arbitrum-one': 'Arbitrum',
+  avalanche: 'Avalanche',
+  linea: 'Linea',
+  zksync: 'zkSync',
+  scroll: 'Scroll',
 };
 
 const env = (key, required = true) => {
@@ -184,6 +197,10 @@ const getTokenPriceKey = (token) => {
   const platformId = getMarketPlatformId(token.networkId);
 
   if (platformId && contractAddress) {
+    const knownCoinId = MARKET_COIN_ID_BY_PLATFORM_CONTRACT[platformId]?.[contractAddress];
+    if (knownCoinId) {
+      return { type: 'coin', coinId: knownCoinId };
+    }
     return { type: 'contract', platformId, contractAddress };
   }
 
@@ -383,11 +400,16 @@ const calculateMessages = (device, prices) => {
       const direction = percentChange > 0 ? 'up' : 'down';
       const percentLabel = `${absChange.toFixed(absChange >= 10 ? 1 : 2)}%`;
       const tokenId = token.tokenId || `${token.networkId}:${token.tokenAddress || token.symbol || 'unknown'}`;
+      const networkLabel =
+        sanitizeText(token.networkLabel) ||
+        NETWORK_LABEL_BY_ID[sanitizeText(token.networkId)] ||
+        sanitizeText(token.networkId) ||
+        'your network';
 
       messages.push({
         to: device.expo_push_token,
         title: `${sanitizeText(token.symbol || 'Token')} price ${direction} ${percentLabel}`,
-        body: `${sanitizeText(token.symbol || 'Token')} is ${direction} to ${formatPrice(currentPrice)} on ${sanitizeText(token.networkId || 'your network')}. Tap to open Doxa and review your position.`,
+        body: `${sanitizeText(token.symbol || 'Token')} is ${direction} to ${formatPrice(currentPrice)} on ${networkLabel}. Tap to open Doxa and review your position.`,
         data: {
           type: 'price-alert',
           tokenId,
@@ -397,6 +419,8 @@ const calculateMessages = (device, prices) => {
           href: `/token-details/${encodeURIComponent(tokenId)}`,
         },
         channelId: 'doxa-price-alerts',
+        priority: 'high',
+        sound: 'default',
       });
 
       token.lastNotifiedAt = now;

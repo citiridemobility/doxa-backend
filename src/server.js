@@ -4610,12 +4610,7 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
       uptodownDownloads: latestDownloads.uptodown?.downloadCount || 0,
       websiteDownloads: websiteDownloadCount,
       totalDownloads,
-      androidDownloads:
-        playStoreDownloadCount ||
-        latestDownloads.apk?.downloadCount ??
-        latestDownloads.website?.downloadCount ??
-        latestDownloads.uptodown?.downloadCount ??
-        0,
+      androidDownloads: playStoreDownloadCount,
       swap: categoryTotals.swap,
       bridge: categoryTotals.bridge,
       xchangeBuy: categoryTotals['xchange-buy'],
@@ -4685,6 +4680,25 @@ async function buildAnalyticsDashboardSummary(days) {
   return reconcileDashboardPaycrestFees(summary, paycrestFeeUsd);
 }
 
+function parseUptodownDownloadCount(html) {
+  const patterns = [
+    /itemprop=["']interactionCount["'][^>]*content=["'](?:UserDownloads|Downloads):(\d+)/i,
+    /"userInteractionCount"\s*:\s*"?(\d+)"?/i,
+    /data-downloads=["'](\d+)["']/i,
+    /<span>\s*(\d[\d,]*)\s*<\/span>\s*<span>\s*downloads/i,
+    /(\d[\d,]*)\s*(?:downloads|descargas)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (!match?.[1]) continue;
+    const count = Number(String(match[1]).replace(/,/g, ''));
+    if (Number.isFinite(count) && count >= 0) return count;
+  }
+
+  return null;
+}
+
 function parsePlayStoreDownloadCount(html) {
   const patterns = [
     /itemprop=["']numDownloads["'][^>]*content=["']([^"']+)["']/i,
@@ -4703,6 +4717,26 @@ function parsePlayStoreDownloadCount(html) {
   }
 
   return null;
+}
+
+async function fetchUptodownDownloadCount(appUrl) {
+  const response = await fetch(appUrl, {
+    headers: {
+      Accept: 'text/html,application/xhtml+xml',
+      'User-Agent': 'DoxaWalletAnalytics/1.0',
+    },
+  });
+  const html = await response.text();
+  if (!response.ok) {
+    throw new HttpError(502, 'uptodown_fetch_failed', `Unable to fetch Uptodown page (${response.status}).`);
+  }
+
+  const downloadCount = parseUptodownDownloadCount(html);
+  if (downloadCount == null) {
+    throw new HttpError(502, 'uptodown_parse_failed', 'Could not parse download count from the Uptodown page. Record the count manually.');
+  }
+
+  return downloadCount;
 }
 
 async function fetchPlayStoreDownloadCount(appUrl) {
@@ -4849,23 +4883,34 @@ async function handleAnalyticsProxy(req, res, url) {
     return;
   }
 
-  if (
-    req.method === 'POST' &&
-    segments.length === 2 &&
-    segments[0] === 'downloads' &&
-    (segments[1] === 'sync-play-store' || segments[1] === 'sync-uptodown')
-  ) {
+  if (req.method === 'POST' && segments.length === 2 && segments[0] === 'downloads' && segments[1] === 'sync-play-store') {
     assertAnalyticsDashboardAccess(req);
     const body = await readJson(req).catch(() => ({}));
-    const appUrl = sanitizeAnalyticsString(
-      body.appUrl || body.app_url || config.playStoreAppUrl,
-      260,
-    );
+    const appUrl = sanitizeAnalyticsString(body.appUrl || body.app_url || config.playStoreAppUrl, 260);
     if (!appUrl) {
       throw new HttpError(400, 'play_store_url_missing', 'Set DOXA_PLAY_STORE_APP_URL or pass appUrl in the request body.');
     }
 
     const { payload, downloadCount } = await syncPlayStoreDownloads(appUrl);
+    sendJson(req, res, 200, { status: 'ok', data: payload, downloadCount });
+    return;
+  }
+
+  if (req.method === 'POST' && segments.length === 2 && segments[0] === 'downloads' && segments[1] === 'sync-uptodown') {
+    assertAnalyticsDashboardAccess(req);
+    const body = await readJson(req).catch(() => ({}));
+    const appUrl = sanitizeAnalyticsString(body.appUrl || body.app_url || config.uptodownAppUrl, 260);
+    if (!appUrl) {
+      throw new HttpError(400, 'uptodown_url_missing', 'Set DOXA_UPTODOWN_APP_URL or pass appUrl in the request body.');
+    }
+
+    const downloadCount = await fetchUptodownDownloadCount(appUrl);
+    const payload = await recordAppDownloadSnapshot({
+      source: 'uptodown',
+      downloadCount,
+      appUrl,
+      metadata: { syncedAt: new Date().toISOString(), method: 'page_parse' },
+    });
     sendJson(req, res, 200, { status: 'ok', data: payload, downloadCount });
     return;
   }
@@ -4880,6 +4925,7 @@ async function handleAnalyticsProxy(req, res, url) {
         'GET /analytics/downloads',
         'POST /analytics/downloads',
         'POST /analytics/downloads/sync-play-store',
+        'POST /analytics/downloads/sync-uptodown',
         'POST /analytics/wallets',
         'POST /analytics/transactions',
       ],

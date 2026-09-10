@@ -4419,6 +4419,13 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
     'xchange-sell': emptyDayMap(),
     bills: emptyDayMap(),
   };
+  const categoryDayFees = {
+    swap: emptyDayMap(),
+    bridge: emptyDayMap(),
+    'xchange-buy': emptyDayMap(),
+    'xchange-sell': emptyDayMap(),
+    bills: emptyDayMap(),
+  };
   const categoryTotals = {
     swap: { count: 0, volumeUsd: 0, feeUsd: 0 },
     bridge: { count: 0, volumeUsd: 0, feeUsd: 0 },
@@ -4506,6 +4513,7 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
     if (tracked && countsTowardVolume && day in categoryDayCounts[tracked]) {
       categoryDayCounts[tracked][day] += 1;
       categoryDayVolume[tracked][day] += amountUsd;
+      categoryDayFees[tracked][day] += platformFeeUsd;
       categoryTotals[tracked].count += 1;
       categoryTotals[tracked].volumeUsd += amountUsd;
       categoryTotals[tracked].feeUsd += platformFeeUsd;
@@ -4632,6 +4640,11 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
       xchangeBuyVolumeByDay: toSeries(categoryDayVolume['xchange-buy']),
       xchangeSellVolumeByDay: toSeries(categoryDayVolume['xchange-sell']),
       billsVolumeByDay: toSeries(categoryDayVolume.bills),
+      swapFeeByDay: toSeries(categoryDayFees.swap),
+      bridgeFeeByDay: toSeries(categoryDayFees.bridge),
+      xchangeBuyFeeByDay: toSeries(categoryDayFees['xchange-buy']),
+      xchangeSellFeeByDay: toSeries(categoryDayFees['xchange-sell']),
+      billsFeeByDay: toSeries(categoryDayFees.bills),
       activityBreakdown,
     },
     breakdowns: {

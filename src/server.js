@@ -388,6 +388,10 @@ const config = {
   sogoBillsUsdtNgnRate: cleanEnvValue(process.env.SOGO_BILLS_USDT_NGN_RATE || process.env.SOGO_BILLS_STABLE_NGN_RATE || process.env.SOGO_BILLS_USDC_NGN_RATE, 'SOGO_BILLS_USDT_NGN_RATE'),
   analyticsDashboardSecret: cleanEnvValue(process.env.DOXA_ANALYTICS_DASHBOARD_SECRET, 'DOXA_ANALYTICS_DASHBOARD_SECRET'),
   uptodownAppUrl: cleanEnvValue(process.env.DOXA_UPTODOWN_APP_URL, 'DOXA_UPTODOWN_APP_URL'),
+  playStoreAppUrl: cleanEnvValue(
+    process.env.DOXA_PLAY_STORE_APP_URL || 'https://play.google.com/store/apps/details?id=com.doxawallet.app',
+    'DOXA_PLAY_STORE_APP_URL',
+  ),
   androidApkUrl: cleanEnvValue(
     process.env.DOXA_ANDROID_APK_URL ||
       'https://expo.dev/artifacts/eas/KBTpEz0-_fSQ2a2ecFdpPkkeEkGyupdBvAygwRwi9QI.apk',
@@ -4522,14 +4526,15 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
     }
   }
 
+  const playStoreDownloadCount = latestDownloads.play_store?.downloadCount || 0;
   const websiteDownloadCount =
     latestDownloads.apk?.downloadCount ??
     latestDownloads.website?.downloadCount ??
     0;
   const totalDownloads =
+    playStoreDownloadCount +
     (latestDownloads.uptodown?.downloadCount || 0) +
     websiteDownloadCount +
-    (latestDownloads.play_store?.downloadCount || 0) +
     (latestDownloads.app_store?.downloadCount || 0) +
     (latestDownloads.other?.downloadCount || 0);
 
@@ -4601,10 +4606,12 @@ function aggregateDashboardMetrics({ wallets, transactions, downloads, days }) {
       completedTransactions: completedCount,
       volumeUsd,
       feeUsd,
+      playStoreDownloads: playStoreDownloadCount,
       uptodownDownloads: latestDownloads.uptodown?.downloadCount || 0,
       websiteDownloads: websiteDownloadCount,
       totalDownloads,
       androidDownloads:
+        playStoreDownloadCount ||
         latestDownloads.apk?.downloadCount ??
         latestDownloads.website?.downloadCount ??
         latestDownloads.uptodown?.downloadCount ??
@@ -4678,43 +4685,59 @@ async function buildAnalyticsDashboardSummary(days) {
   return reconcileDashboardPaycrestFees(summary, paycrestFeeUsd);
 }
 
-function parseUptodownDownloadCount(html) {
+function parsePlayStoreDownloadCount(html) {
   const patterns = [
-    /itemprop=["']interactionCount["'][^>]*content=["'](?:UserDownloads|Downloads):(\d+)/i,
-    /"userInteractionCount"\s*:\s*"?(\d+)"?/i,
-    /data-downloads=["'](\d+)["']/i,
-    /<span>\s*(\d[\d,]*)\s*<\/span>\s*<span>\s*downloads/i,
-    /(\d[\d,]*)\s*(?:downloads|descargas)/i,
+    /itemprop=["']numDownloads["'][^>]*content=["']([^"']+)["']/i,
+    /content=["']([^"']+)["'][^>]*itemprop=["']numDownloads["']/i,
+    /"downloadCount"\s*:\s*"?([\d,.+]+)"?/i,
+    /"numDownloads"\s*:\s*"([^"]+)"/i,
+    /(\d[\d,]*)\+?\s*downloads/i,
   ];
 
   for (const pattern of patterns) {
     const match = html.match(pattern);
     if (!match?.[1]) continue;
-    const count = Number(String(match[1]).replace(/,/g, ''));
+    const digits = String(match[1]).replace(/[^\d]/g, '');
+    const count = Number(digits);
     if (Number.isFinite(count) && count >= 0) return count;
   }
 
   return null;
 }
 
-async function fetchUptodownDownloadCount(appUrl) {
+async function fetchPlayStoreDownloadCount(appUrl) {
   const response = await fetch(appUrl, {
     headers: {
       Accept: 'text/html,application/xhtml+xml',
-      'User-Agent': 'DoxaWalletAnalytics/1.0',
+      'User-Agent': 'Mozilla/5.0 DoxaWalletAnalytics/1.0',
     },
   });
   const html = await response.text();
   if (!response.ok) {
-    throw new HttpError(502, 'uptodown_fetch_failed', `Unable to fetch Uptodown page (${response.status}).`);
+    throw new HttpError(502, 'play_store_fetch_failed', `Unable to fetch Play Store page (${response.status}).`);
   }
 
-  const downloadCount = parseUptodownDownloadCount(html);
+  const downloadCount = parsePlayStoreDownloadCount(html);
   if (downloadCount == null) {
-    throw new HttpError(502, 'uptodown_parse_failed', 'Could not parse download count from the Uptodown page. Record the count manually.');
+    throw new HttpError(
+      502,
+      'play_store_parse_failed',
+      'Could not parse download count from the Play Store page. Record the count manually with POST /analytics/downloads and source play_store.',
+    );
   }
 
   return downloadCount;
+}
+
+async function syncPlayStoreDownloads(appUrl) {
+  const downloadCount = await fetchPlayStoreDownloadCount(appUrl);
+  const payload = await recordAppDownloadSnapshot({
+    source: 'play_store',
+    downloadCount,
+    appUrl,
+    metadata: { syncedAt: new Date().toISOString(), method: 'page_parse' },
+  });
+  return { payload, downloadCount };
 }
 
 async function recordAppDownloadSnapshot({ source, downloadCount, appUrl, metadata = {} }) {
@@ -4759,118 +4782,20 @@ async function incrementAndroidDownloadCount(metadata = {}) {
 
 async function handleAndroidApkDownload(req, res) {
   if (req.method !== 'GET' && req.method !== 'HEAD') {
-    throw new HttpError(405, 'method_not_allowed', 'Use GET to download the Android APK.');
+    throw new HttpError(405, 'method_not_allowed', 'Use GET to open the Play Store listing.');
   }
 
-  if (!config.androidApkUrl) {
-    throw new HttpError(503, 'apk_not_configured', 'Set DOXA_ANDROID_APK_URL on the backend.');
-  }
-
-  // Range / partial requests are resume helpers, not completed installs.
-  if (req.headers.range) {
-    throw new HttpError(416, 'range_not_supported', 'Partial downloads are not supported. Retry the full APK download.');
-  }
-
-  const upstream = await fetch(config.androidApkUrl, {
-    method: req.method,
-    headers: {
-      Accept: 'application/vnd.android.package-archive,application/octet-stream,*/*',
-      'User-Agent': 'DoxaWalletDownloadProxy/1.0',
-    },
-    redirect: 'follow',
-  });
-
-  if (!upstream.ok) {
-    throw new HttpError(502, 'apk_fetch_failed', `Unable to fetch the Android build (${upstream.status}).`);
-  }
-
-  const contentLengthHeader = upstream.headers.get('content-length');
-  const expectedBytes = contentLengthHeader ? Number(contentLengthHeader) : null;
-  const contentType = upstream.headers.get('content-type') || 'application/vnd.android.package-archive';
-  const headers = {
-    'Content-Type': contentType,
-    'Content-Disposition': 'attachment; filename="doxa-wallet.apk"',
-    'Cache-Control': 'no-store',
-  };
-
-  if (Number.isFinite(expectedBytes) && expectedBytes > 0) {
-    headers['Content-Length'] = String(expectedBytes);
+  const playStoreUrl = config.playStoreAppUrl;
+  if (!playStoreUrl) {
+    throw new HttpError(503, 'play_store_url_missing', 'Set DOXA_PLAY_STORE_APP_URL on the backend.');
   }
 
   setCors(req, res);
-
-  if (req.method === 'HEAD') {
-    res.writeHead(200, headers);
-    res.end();
-    return;
-  }
-
-  if (!upstream.body) {
-    throw new HttpError(502, 'apk_fetch_failed', 'The Android build response had no body.');
-  }
-
-  res.writeHead(200, headers);
-
-  let transferredBytes = 0;
-  let clientAborted = false;
-
-  const onClientClose = () => {
-    if (!res.writableEnded) {
-      clientAborted = true;
-    }
-  };
-  req.on('aborted', onClientClose);
-  res.on('close', onClientClose);
-
-  const upstreamStream = Readable.fromWeb(upstream.body);
-  upstreamStream.on('data', (chunk) => {
-    transferredBytes += chunk.length;
+  res.writeHead(302, {
+    Location: playStoreUrl,
+    'Cache-Control': 'no-store',
   });
-
-  try {
-    await pipeline(upstreamStream, res);
-  } catch (error) {
-    clientAborted = true;
-    if (!res.headersSent) {
-      throw error;
-    }
-    console.warn('Android APK download stream ended early', {
-      transferredBytes,
-      expectedBytes,
-      message: error instanceof Error ? error.message : String(error),
-    });
-    return;
-  } finally {
-    req.off('aborted', onClientClose);
-    res.off('close', onClientClose);
-  }
-
-  const transferLooksComplete =
-    !clientAborted &&
-    res.writableEnded &&
-    (expectedBytes == null ||
-      !Number.isFinite(expectedBytes) ||
-      expectedBytes <= 0 ||
-      transferredBytes >= expectedBytes * 0.99);
-
-  if (!transferLooksComplete) {
-    console.warn('Android APK download incomplete; not counted', {
-      transferredBytes,
-      expectedBytes,
-      clientAborted,
-    });
-    return;
-  }
-
-  try {
-    await incrementAndroidDownloadCount({
-      transferredBytes,
-      expectedBytes,
-      userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'].slice(0, 180) : undefined,
-    });
-  } catch (error) {
-    console.error('Failed to record completed Android download', error);
-  }
+  res.end();
 }
 
 async function handleAnalyticsProxy(req, res, url) {
@@ -4883,6 +4808,7 @@ async function handleAnalyticsProxy(req, res, url) {
       service: 'doxa-analytics-proxy',
       configured: Boolean(config.supabaseUrl && config.supabaseServiceRoleKey),
       dashboardConfigured: Boolean(config.analyticsDashboardSecret),
+      playStoreConfigured: Boolean(config.playStoreAppUrl),
       uptodownConfigured: Boolean(config.uptodownAppUrl),
     });
     return;
@@ -4916,28 +4842,30 @@ async function handleAnalyticsProxy(req, res, url) {
     const payload = await recordAppDownloadSnapshot({
       source,
       downloadCount,
-      appUrl: sanitizeAnalyticsString(body.appUrl || body.app_url || config.uptodownAppUrl, 260),
+      appUrl: sanitizeAnalyticsString(body.appUrl || body.app_url || config.playStoreAppUrl || config.uptodownAppUrl, 260),
       metadata: sanitizeAnalyticsMetadata(body.metadata),
     });
     sendJson(req, res, 200, { status: 'ok', data: payload });
     return;
   }
 
-  if (req.method === 'POST' && segments.length === 2 && segments[0] === 'downloads' && segments[1] === 'sync-uptodown') {
+  if (
+    req.method === 'POST' &&
+    segments.length === 2 &&
+    segments[0] === 'downloads' &&
+    (segments[1] === 'sync-play-store' || segments[1] === 'sync-uptodown')
+  ) {
     assertAnalyticsDashboardAccess(req);
     const body = await readJson(req).catch(() => ({}));
-    const appUrl = sanitizeAnalyticsString(body.appUrl || body.app_url || config.uptodownAppUrl, 260);
+    const appUrl = sanitizeAnalyticsString(
+      body.appUrl || body.app_url || config.playStoreAppUrl,
+      260,
+    );
     if (!appUrl) {
-      throw new HttpError(400, 'uptodown_url_missing', 'Set DOXA_UPTODOWN_APP_URL or pass appUrl in the request body.');
+      throw new HttpError(400, 'play_store_url_missing', 'Set DOXA_PLAY_STORE_APP_URL or pass appUrl in the request body.');
     }
 
-    const downloadCount = await fetchUptodownDownloadCount(appUrl);
-    const payload = await recordAppDownloadSnapshot({
-      source: 'uptodown',
-      downloadCount,
-      appUrl,
-      metadata: { syncedAt: new Date().toISOString(), method: 'page_parse' },
-    });
+    const { payload, downloadCount } = await syncPlayStoreDownloads(appUrl);
     sendJson(req, res, 200, { status: 'ok', data: payload, downloadCount });
     return;
   }
@@ -4951,7 +4879,7 @@ async function handleAnalyticsProxy(req, res, url) {
         'GET /analytics/dashboard',
         'GET /analytics/downloads',
         'POST /analytics/downloads',
-        'POST /analytics/downloads/sync-uptodown',
+        'POST /analytics/downloads/sync-play-store',
         'POST /analytics/wallets',
         'POST /analytics/transactions',
       ],

@@ -424,9 +424,10 @@ const calculateMessages = (device, prices) => {
       });
 
       token.lastNotifiedAt = now;
+      token.previousPrice = currentPrice;
     }
 
-    token.previousPrice = currentPrice;
+    token.currentPrice = currentPrice;
     return token;
   });
 

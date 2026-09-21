@@ -4988,12 +4988,67 @@ function sanitizeNotificationString(value) {
   return String(value || '').trim();
 }
 
+function getNotificationWatchKey(token) {
+  const tokenId = sanitizeNotificationString(token?.tokenId);
+  const networkId = sanitizeNotificationString(token?.networkId);
+  const tokenAddress = sanitizeNotificationString(token?.tokenAddress).toLowerCase();
+  const symbol = sanitizeNotificationString(token?.symbol).toUpperCase();
+  return tokenId || `${networkId}:${tokenAddress || symbol}`;
+}
+
+function mergeNotificationWatchTokens(incomingTokens, existingTokens) {
+  if (!incomingTokens.length) {
+    return existingTokens;
+  }
+
+  const existingByKey = new Map(
+    existingTokens.map((token) => [getNotificationWatchKey(token), token]),
+  );
+
+  return incomingTokens.map((token) => {
+    const existing = existingByKey.get(getNotificationWatchKey(token));
+    const existingPrevious = Number(existing?.previousPrice);
+    const incomingPrevious = Number(token.previousPrice);
+    const existingNotifiedAt = Number(existing?.lastNotifiedAt);
+
+    return {
+      ...token,
+      previousPrice:
+        Number.isFinite(existingPrevious) && existingPrevious > 0
+          ? existingPrevious
+          : Number.isFinite(incomingPrevious) && incomingPrevious > 0
+            ? incomingPrevious
+            : token.currentPrice,
+      lastNotifiedAt:
+        Number.isFinite(existingNotifiedAt) && existingNotifiedAt > 0
+          ? existingNotifiedAt
+          : existing?.lastNotifiedAt,
+    };
+  });
+}
+
+async function getExistingNotificationWatchTokens(expoPushToken) {
+  try {
+    const rows = await querySupabase(
+      `doxa_notification_devices?select=tokens&expo_push_token=eq.${encodeURIComponent(expoPushToken)}`,
+      { pageSize: 1, maxRows: 1 },
+    );
+    const tokens = rows?.[0]?.tokens;
+    return Array.isArray(tokens) ? tokens : [];
+  } catch (error) {
+    console.warn('Failed to load existing notification tokens', error instanceof Error ? error.message : error);
+    return [];
+  }
+}
+
 async function sendExpoPushNotification(message) {
+  const expoAccessToken = String(process.env.EXPO_ACCESS_TOKEN || '').trim();
   const response = await fetch('https://exp.host/--/api/v2/push/send', {
     method: 'POST',
     headers: {
       Accept: 'application/json',
       'Content-Type': 'application/json',
+      ...(expoAccessToken ? { Authorization: `Bearer ${expoAccessToken}` } : {}),
     },
     body: JSON.stringify(message),
   });
@@ -5019,7 +5074,7 @@ async function handleNotificationsProxy(req, res, url) {
     }
 
     const rawTokens = Array.isArray(body.tokens) ? body.tokens : [];
-    const tokens = rawTokens
+    const incomingTokens = rawTokens
       .map((token) => {
         if (!token || typeof token !== 'object') return null;
         const currentPrice = Number(token.currentPrice);
@@ -5034,11 +5089,13 @@ async function handleNotificationsProxy(req, res, url) {
           networkLabel: sanitizeNotificationString(token.networkLabel),
           tokenAddress: sanitizeNotificationString(token.tokenAddress).toLowerCase() || undefined,
           currentPrice,
-          previousPrice: Number.isFinite(previousPrice) && previousPrice > 0 ? previousPrice : currentPrice,
+          previousPrice: Number.isFinite(previousPrice) && previousPrice > 0 ? previousPrice : undefined,
           priceLabel: sanitizeNotificationString(token.priceLabel),
         };
       })
       .filter(Boolean);
+    const existingTokens = await getExistingNotificationWatchTokens(expoPushToken);
+    const tokens = mergeNotificationWatchTokens(incomingTokens, existingTokens);
 
     const record = {
       expo_push_token: expoPushToken,

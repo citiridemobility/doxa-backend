@@ -38,6 +38,8 @@ const MARKET_PLATFORM_BY_NETWORK = {
   linea: 'linea',
   zksync: 'zksync',
   scroll: 'scroll',
+  robinhood: 'robinhood',
+  arc: 'arc',
 };
 
 const MARKET_COIN_ID_BY_SYMBOL = {
@@ -60,6 +62,8 @@ const MARKET_NATIVE_COIN_ID_BY_NETWORK = {
   linea: 'ethereum',
   zksync: 'ethereum',
   scroll: 'ethereum',
+  robinhood: 'ethereum',
+  arc: 'usd-coin',
 };
 
 const MARKET_COIN_ID_BY_PLATFORM_CONTRACT = {
@@ -93,6 +97,8 @@ const NETWORK_LABEL_BY_ID = {
   linea: 'Linea',
   zksync: 'zkSync',
   scroll: 'Scroll',
+  robinhood: 'Robinhood',
+  arc: 'Arc',
 };
 
 const env = (key, required = true) => {

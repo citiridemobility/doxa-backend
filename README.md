@@ -17,6 +17,25 @@ Doxa app -> GET /paycrest/orders/:id -> poll payout/refund status
 
 For sell orders, the user's wallet address is sent as `source.refundAddress`. If payout cannot be completed after the user has sent funds, the order can refund crypto back to that source wallet according to the provider's order status flow.
 
+## Xchange buy KYC (Didit)
+
+Paycrest requires every on-ramp order to include `source.kyc`. Doxa disables Buy until the wallet's Didit session is approved, then fetches the approved session server-side to build that Paycrest payload. Sell orders do not use this gate.
+
+Apply [`supabase/doxa_xchange_kyc.sql`](./supabase/doxa_xchange_kyc.sql) once in the same Supabase project as the backend, then configure these backend-only variables:
+
+```env
+DIDIT_API_KEY=your_didit_server_api_key
+DIDIT_WORKFLOW_ID=your_published_didit_kyc_workflow_uuid
+# The public page Didit returns the customer to after the hosted flow completes.
+DIDIT_CALLBACK_URL=https://your-backend-domain/kyc/callback
+# The signing secret for the destination below. Never expose either secret in the app.
+DIDIT_WEBHOOK_SECRET=your_didit_destination_signing_secret
+```
+
+In Didit Business Console, add `https://your-backend-domain/kyc/webhook` as a public HTTPS webhook destination, subscribe it to `status.updated`, and add the callback URL's origin to your Didit allowed domains. The callback URL is optional to Didit, but setting it gives customers a Doxa confirmation page after the hosted verification.
+
+The Expo app derives its KYC endpoint from `EXPO_PUBLIC_PAYCREST_XCHANGE_ENDPOINT` (for example, `https://your-backend-domain/paycrest` becomes `https://your-backend-domain/kyc`). Set `EXPO_PUBLIC_XCHANGE_KYC_ENDPOINT` only when it lives elsewhere.
+
 
 ## Sogo Bills
 

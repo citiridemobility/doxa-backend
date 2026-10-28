@@ -13,6 +13,10 @@
       "destination": "/api/paycrest/:path*"
     },
     {
+      "source": "/kyc/:path*",
+      "destination": "/api/kyc/:path*"
+    },
+    {
       "source": "/market/:path*",
       "destination": "/api/market/:path*"
     },

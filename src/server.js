@@ -57,6 +57,8 @@ const MARKET_PLATFORM_BY_NETWORK = {
   linea: 'linea',
   zksync: 'zksync',
   scroll: 'scroll',
+  robinhood: 'robinhood',
+  arc: 'arc',
 };
 const MARKET_ONCHAIN_NETWORK_BY_PLATFORM = {
   'arbitrum-one': 'arbitrum',
@@ -68,6 +70,8 @@ const MARKET_ONCHAIN_NETWORK_BY_PLATFORM = {
   'optimistic-ethereum': 'optimism',
   scroll: 'scroll',
   zksync: 'zksync',
+  robinhood: 'robinhood',
+  arc: 'arc',
 };
 const MARKET_ONCHAIN_NETWORK_BY_EVM_CHAIN_ID = {
   1: 'eth',
@@ -80,6 +84,8 @@ const MARKET_ONCHAIN_NETWORK_BY_EVM_CHAIN_ID = {
   43114: 'avax',
   534352: 'scroll',
   59144: 'linea',
+  4663: 'robinhood',
+  5042: 'arc',
 };
 const MARKET_DEXSCREENER_CHAIN_BY_PLATFORM = {
   'arbitrum-one': 'arbitrum',
@@ -91,6 +97,8 @@ const MARKET_DEXSCREENER_CHAIN_BY_PLATFORM = {
   'optimistic-ethereum': 'optimism',
   scroll: 'scroll',
   zksync: 'zksync',
+  robinhood: 'robinhood',
+  arc: 'arc',
 };
 const MARKET_TOKEN_DATA_BATCH_SIZE = 25;
 const HISTORY_ALCHEMY_NETWORK_BY_RECEIVE_NETWORK = {
@@ -198,6 +206,8 @@ const MARKET_NATIVE_COIN_ID_BY_NETWORK = {
   linea: 'ethereum',
   zksync: 'ethereum',
   scroll: 'ethereum',
+  robinhood: 'ethereum',
+  arc: 'usd-coin',
 };
 const MARKET_WRAPPED_NATIVE_BY_NETWORK = {
   'bnb-chain': '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c',
@@ -206,6 +216,7 @@ const MARKET_WRAPPED_NATIVE_BY_NETWORK = {
   optimism: '0x4200000000000000000000000000000000000006',
   arbitrum: '0x82af49447d8a07e3bd95bd0d56f35241523fbab1',
   avalanche: '0xb31f66aa3c1e785363f0875a1b74e27b85fd66c7',
+  arc: '0x128cc466b61f542da60c70e3aa11c10e19b84edb',
 };
 const MARKET_COIN_ID_BY_PLATFORM_CONTRACT = {
   'binance-smart-chain': {
@@ -299,6 +310,16 @@ function normalizePaycrestApiBaseUrl(value) {
   return cleaned;
 }
 
+function normalizeDiditApiBaseUrl(value) {
+  const cleaned = cleanEnvValue(value || 'https://verification.didit.me/v3', 'DIDIT_API_BASE_URL').replace(/\/+$/, '');
+
+  if (!cleaned) return 'https://verification.didit.me/v3';
+  if (/\/v3$/i.test(cleaned)) return cleaned;
+  if (/^https?:\/\/verification\.didit\.me$/i.test(cleaned)) return `${cleaned}/v3`;
+
+  return cleaned;
+}
+
 function normalizeTokenDecimals(value, fallbackValue) {
   const cleaned = cleanEnvValue(value);
   const numeric = Number(cleaned || fallbackValue);
@@ -332,6 +353,11 @@ const config = {
   railsFeeAddress: cleanEnvValue(process.env.RAILS_FEE_ADDRESS, 'RAILS_FEE_ADDRESS'),
   paycrestApiBaseUrl: normalizePaycrestApiBaseUrl(process.env.PAYCREST_API_BASE_URL),
   paycrestApiKey: cleanEnvValue(process.env.PAYCREST_API_KEY, 'PAYCREST_API_KEY'),
+  diditApiBaseUrl: normalizeDiditApiBaseUrl(process.env.DIDIT_API_BASE_URL),
+  diditApiKey: cleanEnvValue(process.env.DIDIT_API_KEY, 'DIDIT_API_KEY'),
+  diditWorkflowId: cleanEnvValue(process.env.DIDIT_WORKFLOW_ID, 'DIDIT_WORKFLOW_ID'),
+  diditWebhookSecret: cleanEnvValue(process.env.DIDIT_WEBHOOK_SECRET, 'DIDIT_WEBHOOK_SECRET'),
+  diditCallbackUrl: cleanEnvValue(process.env.DIDIT_CALLBACK_URL, 'DIDIT_CALLBACK_URL'),
   onboardApiBaseUrl: cleanEnvValue(
     process.env.ONBOARD_API_BASE_URL || 'https://external.dev.onboardpay.co',
     'ONBOARD_API_BASE_URL',
@@ -478,9 +504,18 @@ function assertPaycrestConfigured() {
     throw new HttpError(500, 'paycrest_not_configured', 'Set PAYCREST_API_KEY on the backend.');
   }
 }
-function assertAnalyticsConfigured() {
+function assertSupabaseConfigured() {
   if (!config.supabaseUrl || !config.supabaseServiceRoleKey) {
-    throw new HttpError(500, 'analytics_not_configured', 'Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY on the backend.');
+    throw new HttpError(500, 'storage_not_configured', 'Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY on the backend.');
+  }
+}
+function assertAnalyticsConfigured() {
+  assertSupabaseConfigured();
+}
+function assertXchangeKycConfigured() {
+  assertSupabaseConfigured();
+  if (!config.diditApiKey || !config.diditWorkflowId) {
+    throw new HttpError(500, 'kyc_not_configured', 'Set DIDIT_API_KEY and DIDIT_WORKFLOW_ID on the backend.');
   }
 }
 function assertSogoConfigured() {
@@ -495,14 +530,14 @@ function assertSogoBillsCollectionConfigured() {
   }
 }
 
-function readRawBody(req) {
+function readRawBody(req, maxBytes = MAX_JSON_BYTES) {
   return new Promise((resolveBody, rejectBody) => {
     const chunks = [];
     let size = 0;
 
     req.on('data', (chunk) => {
       size += chunk.length;
-      if (size > MAX_JSON_BYTES) {
+      if (size > maxBytes) {
         rejectBody(new HttpError(413, 'payload_too_large', 'Request body is too large.'));
         req.destroy();
         return;
@@ -2626,6 +2661,213 @@ function sanitizePaycrestOrderBody(body) {
   return sanitized;
 }
 
+const DIDIT_STATUS_BY_VALUE = {
+  approved: 'approved',
+  declined: 'declined',
+  'in review': 'in_review',
+  in_review: 'in_review',
+  pending: 'pending',
+  'not finished': 'pending',
+  created: 'pending',
+};
+
+const ISO_ALPHA_2_BY_ALPHA_3 = {
+  AUS: 'AU', BRA: 'BR', CAN: 'CA', CHE: 'CH', CHN: 'CN', DEU: 'DE', ESP: 'ES', FRA: 'FR', GBR: 'GB',
+  GHA: 'GH', IDN: 'ID', IND: 'IN', IRL: 'IE', ITA: 'IT', JPN: 'JP', KEN: 'KE', KOR: 'KR', MEX: 'MX',
+  NLD: 'NL', NGA: 'NG', NOR: 'NO', PHL: 'PH', POL: 'PL', PRT: 'PT', SGP: 'SG', SWE: 'SE', THA: 'TH',
+  TUR: 'TR', UGA: 'UG', USA: 'US', ZAF: 'ZA', ZMB: 'ZM',
+};
+
+function normalizeXchangeKycStatus(value) {
+  const normalized = String(value || '').trim().toLowerCase().replace(/[-_]+/g, ' ');
+  return DIDIT_STATUS_BY_VALUE[normalized] || 'pending';
+}
+
+function normalizeXchangeKycWalletAddress(value) {
+  return normalizePaycrestEvmAddress(value, 'walletAddress').toLowerCase();
+}
+
+function normalizeDiditIssuerCountry(value) {
+  const normalized = String(value || '').trim().toUpperCase();
+  if (/^[A-Z]{2}$/.test(normalized)) return normalized;
+  return ISO_ALPHA_2_BY_ALPHA_3[normalized] || '';
+}
+
+function diditText(value) {
+  return typeof value === 'string' && value.trim() ? value.trim() : '';
+}
+
+function getDiditVerificationValue(verification, keys) {
+  if (!verification || typeof verification !== 'object') return '';
+  for (const key of keys) {
+    const value = diditText(verification[key]);
+    if (value) return value;
+  }
+  return '';
+}
+
+function getDiditApprovedIdVerification(session) {
+  const candidates = Array.isArray(session?.id_verifications) ? session.id_verifications : [];
+  return candidates.find((item) => normalizeXchangeKycStatus(item?.status) === 'approved') || null;
+}
+
+function getPaycrestDocumentType(verification) {
+  const documentType = `${getDiditVerificationValue(verification, ['document_type'])} ${getDiditVerificationValue(verification, ['document_subtype'])}`.toLowerCase();
+  if (documentType.includes('bvn')) return 'BVN';
+  if (documentType.includes('passport')) return 'passport';
+  if (documentType.includes('driver') || documentType.includes('driving')) return 'driverLicense';
+  return 'nationalID';
+}
+
+async function requestDidit(path, { method = 'GET', body } = {}) {
+  if (!config.diditApiKey) {
+    throw new HttpError(500, 'kyc_not_configured', 'Set DIDIT_API_KEY on the backend.');
+  }
+
+  const response = await fetch(`${config.diditApiBaseUrl.replace(/\/$/, '')}${path}`, {
+    method,
+    headers: {
+      'x-api-key': config.diditApiKey,
+      Accept: 'application/json',
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  const payload = await readResponseJson(response);
+
+  if (!response.ok) {
+    throw new HttpError(502, 'kyc_provider_error', 'Identity verification is temporarily unavailable. Please try again later.');
+  }
+
+  return payload?.data && typeof payload.data === 'object' ? payload.data : payload;
+}
+
+async function getXchangeKycRecord(walletAddress) {
+  assertSupabaseConfigured();
+  const url = `${config.supabaseUrl}/rest/v1/doxa_xchange_kyc_verifications?wallet_address=eq.${encodeURIComponent(walletAddress)}&select=wallet_address,didit_session_id,status,verified_at,created_at,updated_at`;
+  const response = await fetch(url, {
+    headers: {
+      apikey: config.supabaseServiceRoleKey,
+      Authorization: `Bearer ${config.supabaseServiceRoleKey}`,
+      Accept: 'application/json',
+    },
+  });
+  const payload = await readResponseJson(response);
+  if (!response.ok) {
+    throw new HttpError(502, 'kyc_storage_error', 'Unable to load your verification status right now.');
+  }
+  return Array.isArray(payload) ? payload[0] || null : null;
+}
+
+async function saveXchangeKycRecord(record) {
+  const payload = await upsertSupabaseRecord('doxa_xchange_kyc_verifications', record, 'wallet_address');
+  return Array.isArray(payload) ? payload[0] || record : record;
+}
+
+async function updateXchangeKycStatus(walletAddress, sessionId, status) {
+  assertSupabaseConfigured();
+  const normalizedStatus = normalizeXchangeKycStatus(status);
+  const url = `${config.supabaseUrl}/rest/v1/doxa_xchange_kyc_verifications?wallet_address=eq.${encodeURIComponent(walletAddress)}&didit_session_id=eq.${encodeURIComponent(sessionId)}`;
+  const response = await fetch(url, {
+    method: 'PATCH',
+    headers: {
+      apikey: config.supabaseServiceRoleKey,
+      Authorization: `Bearer ${config.supabaseServiceRoleKey}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      Prefer: 'return=representation',
+    },
+    body: JSON.stringify({
+      status: normalizedStatus,
+      last_checked_at: new Date().toISOString(),
+      ...(normalizedStatus === 'approved' ? { verified_at: new Date().toISOString() } : {}),
+    }),
+  });
+  const payload = await readResponseJson(response);
+  if (!response.ok) {
+    throw new HttpError(502, 'kyc_storage_error', 'Unable to update your verification status right now.');
+  }
+  return Array.isArray(payload) ? payload[0] || null : null;
+}
+
+async function refreshXchangeKycRecord(record) {
+  if (!record || !record.didit_session_id || ['approved', 'declined'].includes(normalizeXchangeKycStatus(record.status))) {
+    return record;
+  }
+
+  const session = await requestDidit(`/session/${encodeURIComponent(record.didit_session_id)}/decision/`);
+  const status = normalizeXchangeKycStatus(session?.status);
+  const updatedRecord = await updateXchangeKycStatus(record.wallet_address, record.didit_session_id, status);
+  return updatedRecord || record;
+}
+
+function serializeXchangeKycRecord(record) {
+  const status = record ? normalizeXchangeKycStatus(record.status) : 'not_started';
+  return {
+    status,
+    approved: status === 'approved',
+    ...(record?.didit_session_id ? { sessionId: record.didit_session_id } : {}),
+    ...(record?.verified_at ? { verifiedAt: record.verified_at } : {}),
+  };
+}
+
+async function getPaycrestKycForApprovedWallet(walletAddress, currency) {
+  assertXchangeKycConfigured();
+  const record = await getXchangeKycRecord(walletAddress);
+  if (!record || normalizeXchangeKycStatus(record.status) !== 'approved' || !record.didit_session_id) {
+    throw new HttpError(403, 'kyc_required', 'Complete identity verification before buying stablecoins with Xchange.');
+  }
+
+  const session = await requestDidit(`/session/${encodeURIComponent(record.didit_session_id)}/decision/`);
+  if (normalizeXchangeKycStatus(session?.status) !== 'approved') {
+    await updateXchangeKycStatus(walletAddress, record.didit_session_id, session?.status);
+    throw new HttpError(403, 'kyc_required', 'Your identity verification must be approved before buying stablecoins with Xchange.');
+  }
+
+  const verification = getDiditApprovedIdVerification(session);
+  const fullName = getDiditVerificationValue(verification, ['full_name']) || [
+    getDiditVerificationValue(verification, ['first_name']),
+    getDiditVerificationValue(verification, ['last_name']),
+  ].filter(Boolean).join(' ');
+  const birthDate = getDiditVerificationValue(verification, ['date_of_birth']);
+  const documentNumber = getDiditVerificationValue(verification, ['personal_number', 'document_number']).replace(/\s+/g, '');
+  const issuerCountry = normalizeDiditIssuerCountry(getDiditVerificationValue(verification, ['issuing_state']));
+  let documentType = getPaycrestDocumentType(verification);
+
+  if (!fullName || !/^\d{4}-\d{2}-\d{2}$/.test(birthDate) || !documentNumber || !issuerCountry) {
+    throw new HttpError(422, 'kyc_profile_incomplete', 'Your approved verification does not include the identity details required for Xchange. Please contact support.');
+  }
+
+  if (currency === 'NGN') {
+    documentType = documentType === 'BVN' ? 'BVN' : 'nationalID';
+    if (issuerCountry !== 'NG' || !/^\d{11}$/.test(documentNumber)) {
+      throw new HttpError(422, 'kyc_profile_incomplete', 'A verified Nigerian BVN or 11-digit NIN is required to buy stablecoins with NGN.');
+    }
+  }
+
+  const personDetails = {
+    fullName,
+    birthDate,
+    idDocument: {
+      type: documentType,
+      number: documentNumber,
+      issuerCountry,
+    },
+  };
+  const approvedPhoneVerification = Array.isArray(session?.phone_verifications)
+    ? session.phone_verifications.find((item) => normalizeXchangeKycStatus(item?.status) === 'approved')
+    : null;
+  const phone = diditText(session?.contact_details?.phone) || getDiditVerificationValue(approvedPhoneVerification, ['phone', 'phone_number']);
+  if (currency === 'KES') {
+    if (!/^\+254(?:7|1)\d{8}$/.test(phone.replace(/[\s-]/g, ''))) {
+      throw new HttpError(422, 'kyc_profile_incomplete', 'A verified Kenyan mobile number is required to buy stablecoins with KES.');
+    }
+    personDetails.contact = { phoneE164: phone.replace(/[\s-]/g, '') };
+  }
+
+  return { entityType: 'person', personDetails };
+}
+
 function sanitizePaycrestVerifyAccountBody(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     throw new HttpError(400, 'invalid_paycrest_params', 'Account verification payload is required.');
@@ -3599,6 +3841,12 @@ async function handlePaycrestProxy(req, res, url) {
 
   if (req.method === 'POST' && segments.length === 1 && segments[0] === 'orders') {
     const body = sanitizePaycrestOrderBody(await readJson(req));
+    if (body.source.type === 'fiat' && body.destination.type === 'crypto') {
+      body.source.kyc = await getPaycrestKycForApprovedWallet(
+        body.destination.recipient.address.toLowerCase(),
+        body.source.currency,
+      );
+    }
     const payload = await requestPaycrest('/sender/orders', {
       method: 'POST',
       body,
@@ -3617,6 +3865,165 @@ async function handlePaycrestProxy(req, res, url) {
 
   throw new HttpError(404, 'not_found', 'Paycrest route not found.');
 }
+
+function getXchangeKycRouteSegments(url) {
+  const segments = url.pathname.split('/').filter(Boolean);
+  const kycIndex = segments[0] === 'api' ? 1 : 0;
+
+  if (segments[kycIndex] !== 'kyc') {
+    return [];
+  }
+
+  const pathSegments = segments.slice(kycIndex + 1).map((segment) => decodeURIComponent(segment));
+  return pathSegments.length > 0 ? pathSegments : getVercelCatchAllSegments(url);
+}
+
+function canonicalizeDiditWebhookValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalizeDiditWebhookValue);
+  if (value && typeof value === 'object') {
+    return Object.keys(value).sort().reduce((result, key) => {
+      result[key] = canonicalizeDiditWebhookValue(value[key]);
+      return result;
+    }, {});
+  }
+  return value;
+}
+
+function hasMatchingDiditSignature(expected, signatures) {
+  const expectedBuffer = Buffer.from(expected, 'utf8');
+  return signatures.some((signature) => {
+    const actual = String(signature || '').trim().toLowerCase();
+    const actualBuffer = Buffer.from(actual, 'utf8');
+    return actualBuffer.length === expectedBuffer.length && timingSafeEqual(actualBuffer, expectedBuffer);
+  });
+}
+
+function verifyDiditWebhook(payload, rawBody, headers) {
+  if (!config.diditWebhookSecret) {
+    throw new HttpError(500, 'kyc_webhook_not_configured', 'Set DIDIT_WEBHOOK_SECRET on the backend.');
+  }
+
+  const timestamp = Number(headers['x-timestamp']);
+  if (!Number.isFinite(timestamp) || Math.abs(Math.floor(Date.now() / 1000) - timestamp) > 300) {
+    throw new HttpError(401, 'invalid_webhook_signature', 'Invalid verification webhook timestamp.');
+  }
+
+  const v2Signatures = [headers['x-signature-v2'], headers['x-signature-v2-previous']];
+  const canonical = JSON.stringify(canonicalizeDiditWebhookValue(payload));
+  const expectedV2 = createHmac('sha256', config.diditWebhookSecret).update(canonical, 'utf8').digest('hex');
+  if (hasMatchingDiditSignature(expectedV2, v2Signatures)) return;
+
+  const rawSignatures = [headers['x-signature'], headers['x-signature-previous']];
+  const expectedRaw = createHmac('sha256', config.diditWebhookSecret).update(rawBody).digest('hex');
+  if (hasMatchingDiditSignature(expectedRaw, rawSignatures)) return;
+
+  throw new HttpError(401, 'invalid_webhook_signature', 'Invalid verification webhook signature.');
+}
+
+function sendXchangeKycCallbackPage(res) {
+  res.writeHead(200, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+  });
+  res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Verification status | Doxa</title><style>body{margin:0;background:#111827;color:#f9fafb;font-family:system-ui,-apple-system,sans-serif}.card{max-width:480px;margin:15vh auto;padding:32px;text-align:center}h1{font-size:28px}p{line-height:1.6;color:#d1d5db}</style></head><body><main class="card"><h1>Verification received</h1><p>Your identity verification has been submitted. Return to Doxa to check its status and continue with Xchange.</p></main></body></html>`);
+}
+
+async function handleXchangeKyc(req, res, url) {
+  const segments = getXchangeKycRouteSegments(url);
+
+  if (req.method === 'GET' && segments.length === 1 && segments[0] === 'callback') {
+    sendXchangeKycCallbackPage(res);
+    return;
+  }
+
+  if (req.method === 'POST' && segments.length === 1 && segments[0] === 'webhook') {
+    const rawBody = await readRawBody(req, 512 * 1024);
+    let payload;
+    try {
+      payload = JSON.parse(rawBody.toString('utf8'));
+    } catch {
+      throw new HttpError(400, 'invalid_json', 'Webhook body must be valid JSON.');
+    }
+    verifyDiditWebhook(payload, rawBody, req.headers);
+
+    if (payload?.webhook_type === 'status.updated') {
+      const vendorData = diditText(payload.vendor_data) || diditText(payload.metadata?.wallet_address);
+      const sessionId = diditText(payload.session_id);
+      if (vendorData && sessionId && /^0x[a-fA-F0-9]{40}$/.test(vendorData)) {
+        await updateXchangeKycStatus(vendorData.toLowerCase(), sessionId, payload.status || payload.decision?.status);
+      }
+    }
+
+    sendJson(req, res, 200, { status: 'ok' });
+    return;
+  }
+
+  assertCors(req);
+
+  if (req.method === 'GET' && segments.length === 1 && segments[0] === 'health') {
+    sendJson(req, res, 200, {
+      status: 'ok',
+      service: 'doxa-xchange-kyc',
+      configured: Boolean(config.diditApiKey && config.diditWorkflowId && config.supabaseUrl && config.supabaseServiceRoleKey),
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && segments.length === 1 && segments[0] === 'status') {
+    assertXchangeKycConfigured();
+    const walletAddress = normalizeXchangeKycWalletAddress(url.searchParams.get('walletAddress'));
+    const record = await refreshXchangeKycRecord(await getXchangeKycRecord(walletAddress));
+    sendJson(req, res, 200, { data: serializeXchangeKycRecord(record) });
+    return;
+  }
+
+  if (req.method === 'POST' && segments.length === 1 && segments[0] === 'sessions') {
+    assertXchangeKycConfigured();
+    const body = await readJson(req);
+    const walletAddress = normalizeXchangeKycWalletAddress(body.walletAddress);
+    if (body.consent !== true) {
+      throw new HttpError(400, 'kyc_consent_required', 'Consent is required before starting identity verification.');
+    }
+    const previous = await getXchangeKycRecord(walletAddress);
+    if (previous && normalizeXchangeKycStatus(previous.status) === 'approved') {
+      sendJson(req, res, 200, { data: serializeXchangeKycRecord(previous) });
+      return;
+    }
+
+    const session = await requestDidit('/session/', {
+      method: 'POST',
+      body: {
+        workflow_id: config.diditWorkflowId,
+        vendor_data: walletAddress,
+        ...(config.diditCallbackUrl ? { callback: config.diditCallbackUrl, callback_method: 'both' } : {}),
+        metadata: { product: 'doxa_xchange', wallet_address: walletAddress },
+        language: 'en',
+      },
+    });
+    const sessionId = diditText(session?.session_id);
+    const verificationUrl = diditText(session?.url) || diditText(session?.session_url);
+    if (!sessionId || !verificationUrl) {
+      throw new HttpError(502, 'kyc_provider_error', 'Identity verification could not be started. Please try again later.');
+    }
+
+    const record = await saveXchangeKycRecord({
+      wallet_address: walletAddress,
+      didit_session_id: sessionId,
+      status: normalizeXchangeKycStatus(session?.status),
+      consent_at: new Date().toISOString(),
+      last_checked_at: new Date().toISOString(),
+      verified_at: null,
+    });
+    sendJson(req, res, 201, {
+      data: { ...serializeXchangeKycRecord(record), verificationUrl },
+    });
+    return;
+  }
+
+  throw new HttpError(404, 'not_found', 'Xchange KYC route not found.');
+}
+
 function getRailsRouteSegments(url) {
   const segments = url.pathname.split('/').filter(Boolean);
   const railsIndex = segments[0] === 'api' ? 1 : 0;
@@ -4078,7 +4485,7 @@ function sanitizeTransactionAnalyticsBody(body) {
 }
 
 async function upsertSupabaseRecord(tableName, record, onConflict) {
-  assertAnalyticsConfigured();
+  assertSupabaseConfigured();
   const url = `${config.supabaseUrl}/rest/v1/${tableName}?on_conflict=${onConflict}`;
   const response = await fetch(url, {
     method: 'POST',
@@ -5189,6 +5596,7 @@ export async function handleRequest(req, res) {
       url.pathname === '/api/downloads/android';
     const isRailsRoute = url.pathname === '/rails' || url.pathname.startsWith('/rails/') || url.pathname === '/api/rails' || url.pathname.startsWith('/api/rails/');
     const isPaycrestRoute = url.pathname === '/paycrest' || url.pathname.startsWith('/paycrest/') || url.pathname === '/api/paycrest' || url.pathname.startsWith('/api/paycrest/');
+    const isXchangeKycRoute = url.pathname === '/kyc' || url.pathname.startsWith('/kyc/') || url.pathname === '/api/kyc' || url.pathname.startsWith('/api/kyc/');
     const isOnboardRoute = url.pathname === '/onboard' || url.pathname.startsWith('/onboard/') || url.pathname === '/api/onboard' || url.pathname.startsWith('/api/onboard/');
     const isSogoRoute = url.pathname === '/sogo' || url.pathname.startsWith('/sogo/') || url.pathname === '/api/sogo' || url.pathname.startsWith('/api/sogo/');
     const isAnalyticsRoute = url.pathname === '/analytics' || url.pathname.startsWith('/analytics/') || url.pathname === '/api/analytics' || url.pathname.startsWith('/api/analytics/');
@@ -5225,6 +5633,11 @@ export async function handleRequest(req, res) {
 
     if (isPaycrestRoute) {
       await handlePaycrestProxy(req, res, url);
+      return;
+    }
+
+    if (isXchangeKycRoute) {
+      await handleXchangeKyc(req, res, url);
       return;
     }
 
